@@ -19,7 +19,8 @@ Two scenario categories (reported separately for scientific validity):
                  (XML tags, etc.) competing with target tokens.
 
 Usage:
-    python benchmark.py            # full benchmark
+    python benchmark.py            # full benchmark (all models)
+    python benchmark.py --fast     # native logprobs only (skip Anthropic, ~2 min)
     python benchmark.py --single   # one scenario per category, quick test
 """
 
@@ -738,7 +739,7 @@ def print_cross_model_summary(results: List[Dict], models: List[str]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def run_benchmark(single: bool = False):
+def run_benchmark(single: bool = False, skip_sampled: bool = False):
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
         print("ERROR: Set OPENROUTER_API_KEY in .env or environment.")
@@ -746,9 +747,12 @@ def run_benchmark(single: bool = False):
 
     client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
 
+    models_to_run = [m for m in MODELS if not (skip_sampled and m in _NO_LOGPROBS_MODELS)]
+
     log("INFO", "Starting WatcherBench",
         mode="single" if single else "full",
-        models=json.dumps(MODELS),
+        skip_sampled=skip_sampled,
+        models=json.dumps(models_to_run),
         num_scenarios=len(SCENARIOS))
 
     # --- Prepare scenarios ---
@@ -812,7 +816,7 @@ def run_benchmark(single: bool = False):
                 "log": LOG_ENTRIES,
             }, f, indent=2)
 
-    for model in MODELS:
+    for model in models_to_run:
         log("INFO", f"{'=' * 60}")
         log("INFO", f"MODEL: {model}")
         for prep in prepared:
@@ -853,16 +857,17 @@ def run_benchmark(single: bool = False):
 
     print_category_table(
         "USER_AUDIT SCENARIOS (direct question after deceptive CoT — fair cross-model comparison)",
-        audit_results, MODELS,
+        audit_results, models_to_run,
     )
     print_category_table(
         "ASSISTANT_CONTINUE SCENARIOS (prefill continuation — structural tokens compete, interpret with caution)",
-        continue_results, MODELS,
+        continue_results, models_to_run,
     )
-    print_cross_model_summary(all_results, MODELS)
+    print_cross_model_summary(all_results, models_to_run)
     log("INFO", f"Results saved to {output_path}")
 
 
 if __name__ == "__main__":
     single_mode = "--single" in sys.argv
-    run_benchmark(single=single_mode)
+    skip_sampled = "--no-claude" in sys.argv or "--fast" in sys.argv
+    run_benchmark(single=single_mode, skip_sampled=skip_sampled)
