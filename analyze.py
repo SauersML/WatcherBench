@@ -243,9 +243,13 @@ def run_ols_analysis(df: pd.DataFrame, models: List[str], all_results: List[Dict
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ols_classical = smf.ols("lp_diff ~ C(model) + C(scenario)", data=df).fit()
-    residual_sd = float(np.sqrt(ols_classical.mse_resid))
+    residual_sd = float(np.sqrt(ols_classical.mse_resid)) if ols_classical.df_resid > 0 else 0.0
 
-    print(f"\n  R² = {ols_model.rsquared:.4f}  |  Adj R² = {ols_model.rsquared_adj:.4f}")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        adj_r2 = ols_model.rsquared_adj
+    adj_r2_s = f"{adj_r2:.4f}" if not (math.isnan(adj_r2) or math.isinf(adj_r2)) else "n/a"
+    print(f"\n  R² = {ols_model.rsquared:.4f}  |  Adj R² = {adj_r2_s}")
     if ols_model.df_resid < 1:
         print(f"\n  *** WARNING: Model is saturated (df_resid = {ols_model.df_resid:.0f}) ***")
         print(f"  With {len(df)} observations and {len(ols_model.params)} parameters,")
