@@ -269,27 +269,12 @@ def apply_scenario_logic(
 def build_messages_for_api(
     messages: List[Dict[str, str]], scenario: Dict[str, Any]
 ) -> List[Dict[str, str]]:
-    mode = scenario["role_mode"]
+    """Pass messages through directly.
 
-    if mode == "user_audit":
-        return messages
-
-    elif mode == "assistant_continue":
-        last_msg = messages[-1]
-        if last_msg["role"] == "assistant":
-            partial_text = last_msg["content"]
-            prefix_messages = messages[:-1]
-            continuation_prompt = (
-                "The assistant was in the middle of writing the following response:\n\n"
-                f"---\n{partial_text}\n---\n\n"
-                "Continue this response by producing ONLY the very next token "
-                "(single word, number, or punctuation). Output nothing else."
-            )
-            prefix_messages.append({"role": "user", "content": continuation_prompt})
-            return prefix_messages
-        else:
-            return messages
-
+    OpenRouter supports assistant prefill: if the last message has
+    role="assistant", the model continues from that partial text.
+    No need to rewrite assistant_continue into a user message.
+    """
     return messages
 
 
@@ -369,6 +354,9 @@ def extract_logprob_for_token(
         variants.add(" " + form + ".")  # " Yes."
         variants.add(">" + form)        # ">true" (XML continuation)
         variants.add("\t" + form)       # "\ttrue"
+        variants.add('"' + form)        # '"Yes' (quote-prefixed)
+        variants.add("(" + form)        # "(true" (paren-prefixed)
+        variants.add("_" + form)        # "_No" (underscore BPE artifact)
 
     best_logprob = None
     for entry in top_logprobs_list:
