@@ -56,19 +56,28 @@ if os.path.exists(_env_path):
 REPO_BASE_URL = "https://raw.githubusercontent.com/SauersML/scheming_transcripts/main"
 
 MODELS = [
+    # OpenAI — full logprobs (20), prefill works
     "openai/gpt-4.1",
     "openai/gpt-4.1-mini",
     "openai/gpt-4.1-nano",
+    "openai/gpt-4o",
+    # Google — logprobs work, occasional rate limits
     "google/gemma-4-26b-a4b-it",
+    # Mistral — logprobs (20) but NO prefill support (assistant_continue skipped)
     "mistralai/ministral-3b-2512",
     "mistralai/ministral-8b-2512",
     "mistralai/ministral-14b-2512",
+    # Moonshot — logprobs capped at 5, prefill works
     "moonshotai/kimi-k2-0905",
+    # Qwen — full logprobs (20), prefill works
     "qwen/qwen3-235b-a22b-2507",
 ]
 
 # OpenAI models error with require_parameters flag but work without it.
 _OPENAI_MODELS = {m for m in MODELS if m.startswith("openai/")}
+
+# Models that do NOT support assistant prefill — skip assistant_continue scenarios.
+_NO_PREFILL_MODELS = {m for m in MODELS if m.startswith("mistralai/")}
 
 # ---------------------------------------------------------------------------
 # Scenarios
@@ -601,7 +610,12 @@ def run_benchmark(single: bool = False):
         log("INFO", f"{'=' * 60}")
         log("INFO", f"MODEL: {model}")
         for prep in prepared:
-            result = evaluate_scenario(client, model, prep["scenario"], prep["messages"])
+            scen = prep["scenario"]
+            # Skip assistant_continue for models without prefill support
+            if scen["role_mode"] == "assistant_continue" and model in _NO_PREFILL_MODELS:
+                log("INFO", f"Skipping {scen['name']} for {model} (no prefill support)")
+                continue
+            result = evaluate_scenario(client, model, scen, prep["messages"])
             all_results.append(result)
             time.sleep(1.0)
 
