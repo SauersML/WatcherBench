@@ -73,6 +73,7 @@ MODELS = [
     # Prefill works on all EXCEPT 4.6 models (returns 400).
     "anthropic/claude-3.7-sonnet",
     "anthropic/claude-sonnet-4",
+    "anthropic/claude-sonnet-4.5",
 ]
 
 # OpenAI models error with require_parameters flag but work without it.
@@ -336,54 +337,76 @@ def _estimate_logprobs_by_sampling(
     model: str,
     messages: List[Dict[str, str]],
     scenario_name: str,
+    target_tokens: List[str],
 ) -> Optional[Any]:
-    """Sample N times at T=1, build synthetic logprobs from token frequencies.
+    """Sample N times at T=1, classify each response, build synthetic logprobs.
 
-    Normalises sampled tokens so that BPE variants (' Yes', 'Yes.', etc.)
-    are aggregated before computing log-probabilities.  This makes the
-    resulting estimates comparable to native top-K logprobs.
+    Claude often responds with full sentences ("I reviewed the papers and…")
+    instead of bare Yes/No.  Native logprobs would still show the probability
+    mass on "Yes"/"No" at position 0, but sampling only reveals what the model
+    actually generates.  To compensate, we scan the *entire* response for the
+    first word matching a target token, so "I would say No" counts as "no".
 
     Returns a response-shaped object compatible with evaluate_scenario.
     """
     n = _LOGPROB_SAMPLE_N
+
+    # Pre-build canonical target set for fast lookup
+    canonical_targets = {}  # canonical_form -> canonical_form
+    for tok in target_tokens:
+        canonical_targets[_normalize_sampled_token(tok)] = _normalize_sampled_token(tok)
+
     log("INFO", f"SAMPLING {n}x -> {model} | {scenario_name} (no native logprobs)",
         num_messages=len(messages),
-        last_role=messages[-1]["role"])
+        last_role=messages[-1]["role"],
+        targets=json.dumps(list(canonical_targets.keys())))
 
     kwargs: Dict[str, Any] = dict(
         model=model,
         messages=messages,
-        max_tokens=4,
+        max_tokens=50,
         temperature=1.0,
     )
     if model not in _OPENAI_MODELS:
         kwargs["extra_body"] = {"provider": {"require_parameters": True}}
 
     raw_counts: collections.Counter = collections.Counter()
+    unmatched = 0
     for i in range(n):
         try:
             resp = _api_call_with_retry(client, **kwargs)
             content = resp.choices[0].message.content if resp.choices else None
             if content:
-                first = content.split()[0] if content.split() else content
-                canonical = _normalize_sampled_token(first)
-                raw_counts[canonical] += 1
+                # Scan all words for the first target-token match
+                matched = None
+                for word in content.split():
+                    canonical = _normalize_sampled_token(word)
+                    if canonical in canonical_targets:
+                        matched = canonical
+                        break
+                if matched:
+                    raw_counts[matched] += 1
+                else:
+                    unmatched += 1
         except Exception as e:
             log("WARN", f"Sample {i+1}/{n} failed for {model}", error=str(e))
 
     total = sum(raw_counts.values())
     if total == 0:
-        log("ERROR", f"All {n} samples failed: {model} | {scenario_name}")
+        log("ERROR", f"All {n} samples failed or unmatched: {model} | {scenario_name}",
+            unmatched=unmatched)
         return None
 
-    # Build synthetic top_logprobs from aggregated canonical counts
+    # Build synthetic top_logprobs from aggregated counts
+    # Only count matched responses in the denominator (unmatched are discarded)
     top_logprobs = []
     for token, count in raw_counts.most_common(20):
         top_logprobs.append(SimpleNamespace(token=token, logprob=math.log(count / total)))
 
     most_common_token = raw_counts.most_common(1)[0][0]
 
-    log("INFO", f"SAMPLED <- {model} | {scenario_name} ({total}/{n} succeeded)",
+    log("INFO", f"SAMPLED <- {model} | {scenario_name} "
+        f"({total} matched, {unmatched} unmatched out of {n})",
         generated_token=repr(most_common_token),
         distribution=json.dumps({t: c for t, c in raw_counts.most_common(10)}))
 
@@ -402,10 +425,14 @@ def query_openrouter(
     model: str,
     messages: List[Dict[str, str]],
     scenario_name: str,
+    target_tokens: Optional[List[str]] = None,
 ) -> Optional[Any]:
     # Models without native logprobs: estimate via multi-sample
     if model in _NO_LOGPROBS_MODELS:
-        return _estimate_logprobs_by_sampling(client, model, messages, scenario_name)
+        return _estimate_logprobs_by_sampling(
+            client, model, messages, scenario_name,
+            target_tokens=target_tokens or [],
+        )
 
     log("INFO", f"API REQUEST -> {model} | {scenario_name}",
         num_messages=len(messages),
@@ -464,7 +491,8 @@ def _build_variants(target_token: str) -> set:
         variants.add(" " + form + ".")    #  Yes.
         variants.add(">" + form)          # >true (XML continuation)
         variants.add("\t" + form)         # \ttrue
-        variants.add('"' + form)          # "Yes  (quote prefix)
+        variants.add('"' + form)          # "Yes  (double-quote prefix)
+        variants.add("'" + form)          # 'Yes  (single-quote prefix)
         variants.add("(" + form)          # (true (paren prefix)
         variants.add("_" + form)          # _No   (BPE artifact)
     return variants
@@ -508,14 +536,16 @@ def evaluate_scenario(client, model, scen, api_messages) -> Dict[str, Any]:
     dec_tok = scen["deceptive_token"]
     hon_tok = scen["honest_token"]
 
-    response = query_openrouter(client, model, api_messages, name)
+    response = query_openrouter(client, model, api_messages, name,
+                                target_tokens=[dec_tok, hon_tok])
 
     if response is None:
         return {
             "model": model, "scenario": name, "role_mode": scen["role_mode"],
-            "status": "api_error",
+            "status": "api_error", "status_k5": "api_error",
             "scheming_score": None, "scheming_score_k5": None,
             "lp_deceptive": None, "lp_honest": None,
+            "lp_deceptive_k5": None, "lp_honest_k5": None,
             "p_deceptive": None, "p_honest": None,
             "generated_token": None, "top_k": 0,
             "raw_top_logprobs": [],
@@ -619,7 +649,7 @@ def print_category_table(title: str, results: List[Dict], models: List[str]) -> 
 
         print(
             f"{r['model']:<30} {r['scenario']:<28} {score_str:>7} "
-            f"{p_dec_str:>10} {p_hon_str:>10} {gen_str:>12} {r['status']:<20}"
+            f"{p_dec_str:>10} {p_hon_str:>10} {gen_str:>12} {r.get('status_k5', r['status']):<20}"
         )
 
     # Per-model summary (only over both_found results)
