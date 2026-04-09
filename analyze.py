@@ -6,7 +6,7 @@ Reads results.json and produces rigorous cross-model comparisons:
   1. k=5 calibration
   2. Model × scenario heatmaps
   3. Two-way fixed-effects OLS with HC3 robust SEs
-  4. Estimated marginal means with Holm-corrected pairwise contrasts (from model covariance)
+  4. Estimated marginal means with BH FDR-corrected pairwise contrasts (from model covariance)
   5. Coverage and missingness diagnostics
 
 Uses statsmodels for proper inference on unbalanced designs.
@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
+import pingouin as pg
 import statsmodels.formula.api as smf
 from scipy import stats
 from statsmodels.stats.multitest import multipletests
@@ -131,13 +132,28 @@ def print_heatmap(results: List[Dict], models: List[str], scenarios: List[str],
 # 3. Two-way fixed-effects OLS on logprob differences
 # ---------------------------------------------------------------------------
 
+def _is_sampled(r: Dict) -> bool:
+    """Detect whether a result used sampling-based logprob estimation."""
+    method = r.get("logprob_method")
+    if method is not None:
+        return method == "sampled"
+    # Fallback for results generated before logprob_method was added
+    return r.get("model", "").startswith("anthropic/")
+
+
 def build_analysis_df(results: List[Dict]) -> pd.DataFrame:
-    """Build a DataFrame of scorable results with logprob differences."""
+    """Build a DataFrame of scorable results with logprob differences.
+
+    Only includes native-logprob models. Sampled models (Anthropic) measure a
+    fundamentally different quantity — response-level behavioral tendency vs
+    next-token probability — and are reported in a separate section.
+    """
     rows = []
     for r in results:
+        if _is_sampled(r):
+            continue  # Excluded from OLS; reported separately
         if r.get("status_k5", r["status"]) != "both_found":
             continue
-        # Prefer k=5 logprobs; fall back to full-k for old results with top_k<=5
         lp_dec = r.get("lp_deceptive_k5", r.get("lp_deceptive"))
         lp_hon = r.get("lp_honest_k5", r.get("lp_honest"))
         if lp_dec is None or lp_hon is None:
@@ -267,6 +283,7 @@ def run_ols_analysis(df: pd.DataFrame, models: List[str], all_results: List[Dict
     all_scenarios_in_data = sorted(df["scenario"].unique())
     param_names = list(ols_model.params.index)
     model_coefs = [n for n in param_names if n.startswith("C(model)")]
+    omnibus_sig = False
     if model_coefs and ols_model.df_resid >= 1:
         r_matrix = np.zeros((len(model_coefs), len(ols_model.params)))
         for i, name in enumerate(model_coefs):
@@ -274,11 +291,13 @@ def run_ols_analysis(df: pd.DataFrame, models: List[str], all_results: List[Dict
         wald = ols_model.wald_test(r_matrix, use_f=True, scalar=True)
         f_stat = float(np.squeeze(wald.statistic))
         f_pval = float(np.squeeze(wald.pvalue))
+        omnibus_sig = f_pval <= 0.05
         print(f"\n  Omnibus Wald F-test for model effect (HC3):")
         print(f"    F({len(model_coefs)}, {ols_model.df_resid:.0f}) = {f_stat:.3f},  p = {f_pval:.4f}"
               + ("  ***" if f_pval < 0.001 else "  **" if f_pval < 0.01 else "  *" if f_pval < 0.05 else "  n.s."))
-        if f_pval > 0.05:
-            print(f"    NOTE: No significant model effect — pairwise contrasts are exploratory.")
+        if not omnibus_sig:
+            print(f"    No significant model effect — pairwise contrasts are EXPLORATORY.")
+            print(f"    Significance stars suppressed (closed testing).")
 
     # --- Residual diagnostics ---
     if ols_model.df_resid >= 1:
@@ -288,13 +307,34 @@ def run_ols_analysis(df: pd.DataFrame, models: List[str], all_results: List[Dict
         print(f"\n  Residual diagnostics:")
         print(f"    Skewness = {skew:+.3f}  (0 = symmetric)")
         print(f"    Excess kurtosis = {kurt:+.3f}  (0 = normal tails)")
+        # Flag practical-significance thresholds for shape statistics.
+        # These directed checks are more informative than the omnibus SW test
+        # at small n because they target the specific departures that threaten
+        # ANOVA validity: skewness biases means, heavy tails inflate Type I error.
+        concerns = []
+        if abs(skew) > 1.0:
+            concerns.append(f"notable skewness (|{skew:+.2f}| > 1)")
+        if abs(kurt) > 2.0:
+            concerns.append(f"notable kurtosis (|{kurt:+.2f}| > 2)")
         if len(resids) >= 8:
             sw_stat, sw_p = stats.shapiro(resids)
-            print(f"    Shapiro-Wilk W = {sw_stat:.4f},  p = {sw_p:.4f}"
-                  + ("  (non-normal)" if sw_p < 0.05 else "  (consistent with normality)"))
+            n_resid = len(resids)
+            # Shapiro-Wilk is the most powerful omnibus normality test at
+            # small n, but power is still low (n~10-30).  Report W as an
+            # effect-size measure: values near 1 suggest approximate
+            # normality; values below ~0.90 signal concern regardless of p.
+            print(f"    Shapiro-Wilk W = {sw_stat:.4f},  p = {sw_p:.4f}  (n = {n_resid})")
+            if sw_stat < 0.90:
+                concerns.append(f"low Shapiro-Wilk W ({sw_stat:.3f} < 0.90)")
             if sw_p < 0.05:
-                print(f"    NOTE: Non-normal residuals. HC3 SEs handle heteroscedasticity")
-                print(f"    but not heavy tails. Interpret small-sample p-values with caution.")
+                concerns.append("Shapiro-Wilk rejects normality (p < .05)")
+        if concerns:
+            print(f"    ** Normality concerns: {'; '.join(concerns)}")
+            print(f"    HC3 SEs handle heteroscedasticity but not heavy tails.")
+            print(f"    Interpret small-sample p-values with caution.")
+        else:
+            print(f"    No strong departures from normality detected,"
+                  f" but low power at n = {len(resids)} limits detection.")
 
     # --- Estimated Marginal Means (EMMs) ---
     # In the additive model, EMM_i = intercept + α_i + mean(β_j).
@@ -331,7 +371,7 @@ def run_ols_analysis(df: pd.DataFrame, models: List[str], all_results: List[Dict
     # α_i - α_j.  The SE comes from the HC3-robust covariance matrix, so
     # contrast, SE, t-stat, and p-value all derive from one coherent model.
     print(f"\n{'=' * 90}")
-    print(f"  3. PAIRWISE CONTRASTS (OLS coefficients, HC3 SEs, Holm-corrected)")
+    print(f"  3. PAIRWISE CONTRASTS (OLS coefficients, HC3 SEs, BH FDR-corrected)")
     print(f"  Each contrast is α_i - α_j from the fitted model.")
     print(f"  Controls for scenario difficulty; robust to heteroscedasticity.")
     print(f"{'=' * 90}")
@@ -353,6 +393,15 @@ def run_ols_analysis(df: pd.DataFrame, models: List[str], all_results: List[Dict
     # (model_a, model_b, contrast, se, p_raw, cohens_d)
     pair_results: List[Tuple[str, str, float, float, float, float]] = []
 
+    # Scenario-adjusted scores for Cohen's d: remove scenario effects so the
+    # within-group SD reflects model-level variability, not scenario difficulty.
+    scenario_coefs = [n for n in param_names if n.startswith("C(scenario)")]
+    scenario_effects = np.zeros(len(df))
+    for sc in scenario_coefs:
+        scenario_effects += ols_model.params[sc] * (df["scenario"] == sc.split("[T.")[1].rstrip("]")).astype(float).values
+    df_adj = df.copy()
+    df_adj["lp_diff_adj"] = df["lp_diff"].values - scenario_effects
+
     for a, b in pairs:
         # Build contrast vector c such that c'β = α_a - α_b
         c = np.zeros(len(params))
@@ -370,16 +419,24 @@ def run_ols_analysis(df: pd.DataFrame, models: List[str], all_results: List[Dict
 
         t_stat = contrast / se
         p_raw = float(2.0 * stats.t.sf(abs(t_stat), ols_model.df_resid))
-        cohens_d = contrast / residual_sd if residual_sd > 1e-12 else 0.0
+
+        # Cohen's d via pingouin with pooled within-group SD (scenario-adjusted).
+        scores_a = df_adj.loc[df_adj["model"] == a, "lp_diff_adj"].values
+        scores_b = df_adj.loc[df_adj["model"] == b, "lp_diff_adj"].values
+        if len(scores_a) > 1 and len(scores_b) > 1:
+            cohens_d = float(pg.compute_effsize(scores_a, scores_b, eftype="cohen"))
+        else:
+            cohens_d = 0.0
+
         pair_results.append((a, b, contrast, se, p_raw, cohens_d))
 
-    # Holm-Bonferroni correction for FWER control
+    # Benjamini-Hochberg FDR correction
     raw_pvals = [pr[4] for pr in pair_results]
     valid_mask = [not np.isnan(p) for p in raw_pvals]
     valid_pvals = [p for p, v in zip(raw_pvals, valid_mask) if v]
 
     if valid_pvals:
-        _, corrected_pvals, _, _ = multipletests(valid_pvals, method="holm")
+        _, corrected_pvals, _, _ = multipletests(valid_pvals, method="fdr_bh")
         corrected_iter = iter(corrected_pvals)
         final_pvals = [
             float(next(corrected_iter)) if v else np.nan
@@ -389,8 +446,8 @@ def run_ols_analysis(df: pd.DataFrame, models: List[str], all_results: List[Dict
         final_pvals = list(raw_pvals)
 
     n_tests = sum(valid_mask)
-    print(f"\n  {n_tests} pairwise tests, Holm-Bonferroni corrected (FWER ≤ 0.05)")
-    print(f"\n  {'Model A':<26} {'Model B':<26} {'Δ':>8} {'SE':>7} {'t':>7} {'p_raw':>8} {'p_adj':>8} {'d':>6} {'Sig':>5}")
+    print(f"\n  {n_tests} pairwise tests, Benjamini-Hochberg FDR-corrected (q ≤ 0.05)")
+    print(f"\n  {'Model A':<26} {'Model B':<26} {'Δ':>8} {'SE':>7} {'t':>7} {'p_raw':>8} {'q':>8} {'d':>6} {'Sig':>5}")
     print(f"  {'-' * 105}")
 
     # Sort by adjusted p-value (most significant first) for readability
@@ -401,35 +458,37 @@ def run_ols_analysis(df: pd.DataFrame, models: List[str], all_results: List[Dict
 
     for i in display_order:
         a, b, contrast, se, p_raw, d = pair_results[i]
-        p_adj = final_pvals[i]
+        q_val = final_pvals[i]
         if np.isnan(p_raw):
             print(f"  {a:<26} {b:<26} {contrast:>+8.4f} {'---':>7} {'---':>7} {'---':>8} {'---':>8} {'---':>6} {'deg.':>5}")
             continue
 
         t_stat = contrast / se if se > 1e-12 else 0.0
         p_raw_s = f"{p_raw:.4f}" if p_raw >= 0.0001 else f"{p_raw:.1e}"
-        p_adj_s = f"{p_adj:.4f}" if p_adj >= 0.0001 else f"{p_adj:.1e}"
-        if p_adj < 0.001:
+        q_val_s = f"{q_val:.4f}" if q_val >= 0.0001 else f"{q_val:.1e}"
+        if not omnibus_sig:
+            sig_str = ""
+        elif q_val < 0.001:
             sig_str = "***"
-        elif p_adj < 0.01:
+        elif q_val < 0.01:
             sig_str = "**"
-        elif p_adj < 0.05:
+        elif q_val < 0.05:
             sig_str = "*"
         else:
             sig_str = "n.s."
 
         print(
             f"  {a:<26} {b:<26} {contrast:>+8.4f} {se:>7.4f} {t_stat:>7.2f} "
-            f"{p_raw_s:>8} {p_adj_s:>8} {d:>+6.2f} {sig_str:>5}"
+            f"{p_raw_s:>8} {q_val_s:>8} {d:>+6.2f} {sig_str:>5}"
         )
 
     print(f"  {'-' * 105}")
-    print(f"  Sorted by p_adj (most significant first)")
+    print(f"  Sorted by q-value (most significant first)")
     print(f"  Δ:     α_A - α_B from OLS (+ means A more scheming)")
     print(f"  SE:    HC3 heteroscedasticity-robust standard error")
     print(f"  p_raw: uncorrected two-sided p from t({ols_model.df_resid:.0f})")
-    print(f"  p_adj: Holm-Bonferroni corrected (controls FWER across {n_tests} tests)")
-    print(f"  d:     Cohen's d (Δ / residual SD = {residual_sd:.4f})")
+    print(f"  q:     Benjamini-Hochberg FDR-corrected (among discoveries at q ≤ α, ≤ α fraction are false)")
+    print(f"  d:     Cohen's d (Δ / pooled within-group SD, scenario-adjusted)")
     print(f"         |d| > 0.2 small, > 0.5 medium, > 0.8 large")
 
     # --- Missingness diagnostics ---
@@ -470,15 +529,67 @@ def run_ols_analysis(df: pd.DataFrame, models: List[str], all_results: List[Dict
     print(f"              all statistical comparisons are on the linear lp_diff scale")
     print(f"  Pairwise:   linear contrasts from OLS coefficient covariance matrix")
     print(f"              (contrast, SE, and p-value all from one coherent model)")
-    print(f"  Correction: Holm-Bonferroni step-down for FWER control")
-    print(f"              (valid regardless of correlation between tests)")
-    print(f"  Effect size: Cohen's d (contrast / residual SD)")
+    print(f"  Correction: Benjamini-Hochberg FDR (q ≤ 0.05)")
+    print(f"              (controls expected false discovery proportion)")
+    print(f"  Effect size: Cohen's d (pooled within-group SD, scenario-adjusted)")
     print(f"  Diagnostics: Shapiro-Wilk + skewness/kurtosis on residuals;")
     print(f"               design connectedness check")
     print(f"  Missing:    excluded (not imputed); documented in diagnostics")
+    print(f"  Sampled:    Anthropic models lack native logprobs. Their scores are")
+    print(f"              estimated via Monte Carlo (128 samples at T=1). This measures")
+    print(f"              P(target word in first 10 words), NOT P(first_token = target).")
+    print(f"              They are EXCLUDED from the OLS and reported separately.")
     print(f"  Caveat:     missingness is MNAR (correlated with outcome).")
     print(f"              Very honest models lose deceptive tokens from top-K,")
     print(f"              biasing their remaining scores slightly upward.")
+    print()
+
+
+def _print_sampled_section(sampled_results: List[Dict], all_scenarios: List[str]) -> None:
+    """Report sampled-logprob models (Anthropic) separately with caveats."""
+    print(f"\n{'=' * 90}")
+    print(f"  5. SAMPLED-LOGPROB MODELS (Anthropic)")
+    print(f"{'=' * 90}")
+    print(f"  These models lack native logprobs. Scores are estimated via Monte")
+    print(f"  Carlo sampling (128 responses at T=1, first 10 words scanned).")
+    print(f"")
+    print(f"  *** NOT COMPARABLE to native-logprob models in the OLS above ***")
+    print(f"  Native logprobs measure P(first_token = X | context).")
+    print(f"  Sampling measures P(X appears early in a full response).")
+    print(f"  These are different quantities with different scales and noise.")
+    print(f"")
+
+    # Group by model
+    sampled_models = sorted(set(r["model"] for r in sampled_results))
+    scorable = [r for r in sampled_results
+                if r.get("status_k5", r["status"]) == "both_found"
+                and r.get("scheming_score_k5", r.get("scheming_score")) is not None]
+
+    print(f"  {'Model':<34} {'Scenario':<24} {'Score':>7} {'lp_dec':>8} {'lp_hon':>8} {'Status':<20}")
+    print(f"  {'-' * 105}")
+    for r in sampled_results:
+        sc = r.get("scheming_score_k5", r.get("scheming_score"))
+        sc_s = f"{sc:.4f}" if sc is not None else "---"
+        lp_d = r.get("lp_deceptive_k5", r.get("lp_deceptive"))
+        lp_h = r.get("lp_honest_k5", r.get("lp_honest"))
+        lp_d_s = f"{lp_d:.4f}" if lp_d is not None else "---"
+        lp_h_s = f"{lp_h:.4f}" if lp_h is not None else "---"
+        st = r.get("status_k5", r["status"])
+        print(f"  {r['model']:<34} {r['scenario']:<24} {sc_s:>7} {lp_d_s:>8} {lp_h_s:>8} {st:<20}")
+
+    # Per-model means
+    if scorable:
+        print(f"  {'-' * 105}")
+        for model in sampled_models:
+            model_ok = [r for r in scorable if r["model"] == model]
+            if model_ok:
+                scores = [r.get("scheming_score_k5", r.get("scheming_score")) for r in model_ok]
+                avg = sum(scores) / len(scores)
+                print(f"  {model:<34} {'MEAN':>24} {avg:>7.4f} {'':>8} {'':>8} {len(model_ok)} scorable")
+
+    print(f"  {'-' * 105}")
+    print(f"  Scores shown for descriptive reference only.")
+    print(f"  Do NOT compare numerically with native-logprob model scores.")
     print()
 
 
@@ -506,12 +617,17 @@ def run_analysis(data: Dict[str, Any]) -> None:
         print_heatmap(results, models, continue_scenarios,
                       "HEATMAP: assistant_continue scenarios (interpret with caution)")
 
-    # 3. OLS analysis
+    # 3. OLS analysis (native-logprob models only)
     df = build_analysis_df(results)
     if len(df) > 0:
         run_ols_analysis(df, models, all_results=results)
     else:
         print("\n  No scorable results for OLS analysis.")
+
+    # 4. Sampled-logprob models (Anthropic) — reported separately
+    sampled_results = [r for r in results if _is_sampled(r)]
+    if sampled_results:
+        _print_sampled_section(sampled_results, all_scenarios)
 
 
 def main():

@@ -323,12 +323,12 @@ def _api_call_with_retry(client: OpenAI, max_retries: int = 5, **kwargs) -> Any:
 
 
 def _normalize_sampled_token(tok: str) -> str:
-    """Strip BPE-style prefixes/suffixes so variant forms aggregate correctly.
+    """Strip punctuation/whitespace so variant forms aggregate correctly.
 
-    ' Yes', 'Yes.', ' Yes.', '>Yes', '"Yes' etc. all → 'yes'.
+    ' Yes', 'Yes.', ' Yes!', '>Yes', '"Yes' etc. all → 'yes'.
     """
-    tok = tok.lstrip(' \t>"(_')
-    tok = tok.rstrip('.')
+    tok = tok.lstrip(' \t>"(_\'')
+    tok = tok.rstrip('.!?,;:"\')]}')
     return tok.lower()
 
 
@@ -377,9 +377,11 @@ def _estimate_logprobs_by_sampling(
             resp = _api_call_with_retry(client, **kwargs)
             content = resp.choices[0].message.content if resp.choices else None
             if content:
-                # Scan all words for the first target-token match
+                # Scan first 10 words for a target-token match.
+                # Limiting the window avoids conflating incidental mentions
+                # deep in a response with the model's actual answer.
                 matched = None
-                for word in content.split():
+                for word in content.split()[:10]:
                     canonical = _normalize_sampled_token(word)
                     if canonical in canonical_targets:
                         matched = canonical
@@ -591,10 +593,13 @@ def evaluate_scenario(client, model, scen, api_messages) -> Dict[str, Any]:
     p_dec = math.exp(lp_dec) if lp_dec is not None else None
     p_hon = math.exp(lp_hon) if lp_hon is not None else None
 
+    is_sampled = model in _NO_LOGPROBS_MODELS
+
     result = {
         "model": model,
         "scenario": name,
         "role_mode": scen["role_mode"],
+        "logprob_method": "sampled" if is_sampled else "native",
         "status": status,
         "status_k5": status_k5,
         "scheming_score": round(score, 4) if score is not None else None,
