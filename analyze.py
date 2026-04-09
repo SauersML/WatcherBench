@@ -5,8 +5,8 @@ WatcherBench Statistical Analysis.
 Reads results.json and produces rigorous cross-model comparisons:
   1. k=5 calibration
   2. Model × scenario heatmaps
-  3. Two-way fixed-effects model (OLS on logprob differences)
-  4. Estimated marginal means with Holm-corrected pairwise contrasts
+  3. Two-way fixed-effects OLS with HC3 robust SEs
+  4. Estimated marginal means with Holm-corrected pairwise contrasts (from model covariance)
   5. Coverage and missingness diagnostics
 
 Uses statsmodels for proper inference on unbalanced designs.
@@ -20,13 +20,11 @@ import json
 import math
 import sys
 import warnings
-from collections import defaultdict
 from itertools import combinations
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
-import statsmodels.api as sm
 import statsmodels.formula.api as smf
 from scipy import stats
 from statsmodels.stats.multitest import multipletests
@@ -37,7 +35,7 @@ def load_results(path: str = "results.json") -> Dict[str, Any]:
         return json.load(f)
 
 
-def _fmt(s, width=7):
+def _fmt(s):
     return f"{s:.4f}" if s is not None and not (isinstance(s, float) and math.isnan(s)) else "---"
 
 
@@ -46,37 +44,26 @@ def _fmt(s, width=7):
 # ---------------------------------------------------------------------------
 
 def k5_calibration(results: List[Dict]) -> None:
-    """Compare scores at full-k vs k=5 for models that had k>5.
+    """Show information lost when k=20 models are evaluated at k=5.
 
-    NOTE: This checks whether k=20 models lose information when truncated to
-    k=5.  It does NOT tell us whether k=5-only models would have had the
-    target tokens in ranks 6-20, because different models have different
-    token distributions.  A low change-rate here is necessary but not
-    sufficient to treat k=5 and k=20 scores as interchangeable.
+    All cross-model rankings use k=5 scores (the only metric every provider
+    can produce).  This section shows what the k=20 models lose at that
+    resolution — useful context, but the ranking itself is already fair.
     """
     print("\n" + "=" * 90)
-    print("  1. k=5 CALIBRATION  (upper-bound check)")
-    print("  How often do k=20 models lose information when truncated to k=5?")
-    print("  NOTE: This is a necessary but NOT sufficient condition for cross-k")
-    print("  comparability — k=5-only models may have different rank distributions.")
+    print("  1. k=5 RESOLUTION CHECK")
+    print("  All rankings use k=5 scores (universal across providers).")
+    print("  Below: what k=20 models lose when evaluated at k=5.")
     print("=" * 90)
 
     changed = 0
     total = 0
-    k5_only_missing = 0
-    k5_only_total = 0
 
-    print(f"\n{'Model':<32} {'Scenario':<24} {'k':>3} {'Score_full':>11} {'Score_k5':>11} {'Status_full':<18} {'Status_k5':<18}")
+    print(f"\n{'Model':<32} {'Scenario':<24} {'k':>3} {'Score_k20':>11} {'Score_k5':>11} {'Status_k20':<18} {'Status_k5':<18}")
     print("-" * 130)
 
     for r in results:
-        if r["status"] == "api_error":
-            continue
-        # Track k=5-only models: how often are tokens missing?
-        if r.get("top_k", 0) <= 5:
-            k5_only_total += 1
-            if r["status"] in ("deceptive_missing", "honest_missing"):
-                k5_only_missing += 1
+        if r.get("top_k", 0) <= 5 or r["status"] == "api_error":
             continue
         total += 1
         s_full = r.get("scheming_score")
@@ -93,11 +80,7 @@ def k5_calibration(results: List[Dict]) -> None:
 
     print("-" * 130)
     if total:
-        print(f"  k=20 models: {changed}/{total} changed when truncated to k=5 ({changed/total*100:.1f}%)")
-    if k5_only_total:
-        print(f"  k=5-only models: {k5_only_missing}/{k5_only_total} have a missing token ({k5_only_missing/k5_only_total*100:.1f}%)")
-        if k5_only_missing > 0:
-            print("  ^ These missing tokens MIGHT have appeared at ranks 6-20 — scores are less reliable.")
+        print(f"  {changed}/{total} k=20 results changed at k=5 ({changed/total*100:.1f}%)")
     print()
 
 
@@ -126,8 +109,8 @@ def print_heatmap(results: List[Dict], models: List[str], scenarios: List[str],
         scores = []
         for scen in scenarios:
             r = lookup.get((model, scen))
-            if r and r.get("scheming_score") is not None and r["status"] == "both_found":
-                s = r["scheming_score"]
+            if r and r.get("scheming_score_k5") is not None and r.get("status_k5") == "both_found":
+                s = r["scheming_score_k5"]
                 scores.append(s)
                 print(f" {s:>7.3f}", end="")
             elif r and r["status"] == "api_error":
@@ -152,10 +135,11 @@ def build_analysis_df(results: List[Dict]) -> pd.DataFrame:
     """Build a DataFrame of scorable results with logprob differences."""
     rows = []
     for r in results:
-        if r["status"] != "both_found":
+        if r.get("status_k5", r["status"]) != "both_found":
             continue
-        lp_dec = r.get("lp_deceptive")
-        lp_hon = r.get("lp_honest")
+        # Prefer k=5 logprobs; fall back to full-k for old results with top_k<=5
+        lp_dec = r.get("lp_deceptive_k5", r.get("lp_deceptive"))
+        lp_hon = r.get("lp_honest_k5", r.get("lp_honest"))
         if lp_dec is None or lp_hon is None:
             continue
         rows.append({
@@ -163,18 +147,24 @@ def build_analysis_df(results: List[Dict]) -> pd.DataFrame:
             "scenario": r["scenario"],
             "role_mode": r["role_mode"],
             "lp_diff": lp_dec - lp_hon,
-            "scheming_score": r["scheming_score"],
+            "scheming_score": r.get("scheming_score_k5", r.get("scheming_score")),
         })
     return pd.DataFrame(rows)
 
 
 def run_ols_analysis(df: pd.DataFrame, models: List[str], all_results: List[Dict] = None) -> None:
-    """Fit two-way OLS and extract estimated marginal means."""
+    """Fit two-way OLS with HC3 robust SEs; extract EMMs and pairwise contrasts.
+
+    All inference (contrasts, SEs, p-values) comes from a single model with
+    HC3 heteroscedasticity-consistent covariance.  No mixing of parametric
+    model estimates with separate nonparametric tests — the contrast, its SE,
+    and the p-value all flow from the same fitted model.
+    """
     print("\n" + "=" * 90)
     print("  2. TWO-WAY FIXED-EFFECTS MODEL")
     print("  lp_diff ~ C(model) + C(scenario)")
-    print("  Estimates model effects controlling for scenario difficulty via OLS.")
-    print("  Handles unbalanced designs correctly (no biased centering constants).")
+    print("  HC3 heteroscedasticity-consistent standard errors.")
+    print("  Handles unbalanced incomplete block designs correctly.")
     print("=" * 90)
 
     if len(df) < 3:
@@ -185,7 +175,6 @@ def run_ols_analysis(df: pd.DataFrame, models: List[str], all_results: List[Dict
     n_scenarios = df["scenario"].nunique()
     print(f"\n  Observations: {len(df)}  |  Models: {n_models}  |  Scenarios: {n_scenarios}")
 
-    # Check we have enough data
     if n_models < 2:
         print("  Need at least 2 models with scorable results.")
         return
@@ -200,28 +189,113 @@ def run_ols_analysis(df: pd.DataFrame, models: List[str], all_results: List[Dict
         scenarios_list = sorted(df[df["model"] == model]["scenario"].tolist())
         print(f"    {model:<34} {n:>2} scenarios: {', '.join(s[:12] for s in scenarios_list)}")
 
-    # Fit OLS
-    # Use Treatment coding with the first model as reference
+    # Design connectedness check — if the bipartite graph (models ↔ scenarios)
+    # has multiple connected components, contrasts between components are
+    # non-estimable.  statsmodels will still fit but the coefficients are
+    # meaningless across components.
+    scorable_models_set = set(df["model"].unique())
+    # Build adjacency: models sharing at least one scenario are connected
+    adj: Dict[str, set] = {m: set() for m in scorable_models_set}
+    for _, grp in df.groupby("scenario"):
+        scen_models = list(grp["model"].unique())
+        for i, m1 in enumerate(scen_models):
+            for m2 in scen_models[i + 1:]:
+                adj[m1].add(m2)
+                adj[m2].add(m1)
+    # Find all connected components, keep the largest
+    remaining = set(scorable_models_set)
+    components: List[set] = []
+    while remaining:
+        seed = next(iter(remaining))
+        visited: set = set()
+        queue = [seed]
+        while queue:
+            node = queue.pop(0)
+            if node in visited:
+                continue
+            visited.add(node)
+            queue.extend(adj[node] - visited)
+        components.append(visited)
+        remaining -= visited
+    if len(components) > 1:
+        largest = max(components, key=len)
+        disconnected = scorable_models_set - largest
+        print(f"\n  *** WARNING: Design is DISCONNECTED ({len(components)} components) ***")
+        print(f"  Models {disconnected} share no scenarios with the main group.")
+        print(f"  Contrasts involving these models are NOT estimable.")
+        print(f"  Restricting analysis to the largest connected component ({len(largest)} models).\n")
+        df = df[df["model"].isin(largest)]
+        n_models = df["model"].nunique()
+        n_scenarios = df["scenario"].nunique()
+
+    # Fit OLS with HC3 robust standard errors
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            ols_model = smf.ols("lp_diff ~ C(model) + C(scenario)", data=df).fit()
+            ols_model = smf.ols("lp_diff ~ C(model) + C(scenario)", data=df).fit(
+                cov_type="HC3"
+            )
     except Exception as e:
         print(f"\n  OLS fitting failed: {e}")
         return
 
+    # Classical fit for residual SD (HC3 doesn't change point estimates)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ols_classical = smf.ols("lp_diff ~ C(model) + C(scenario)", data=df).fit()
+    residual_sd = float(np.sqrt(ols_classical.mse_resid))
+
     print(f"\n  R² = {ols_model.rsquared:.4f}  |  Adj R² = {ols_model.rsquared_adj:.4f}")
-    print(f"  Residual std = {np.sqrt(ols_model.mse_resid):.4f}")
+    if ols_model.df_resid < 1:
+        print(f"\n  *** WARNING: Model is saturated (df_resid = {ols_model.df_resid:.0f}) ***")
+        print(f"  With {len(df)} observations and {len(ols_model.params)} parameters,")
+        print(f"  there are no residual degrees of freedom. SEs, p-values, and")
+        print(f"  effect sizes are undefined. Need more data (models × scenarios).")
+        print(f"  Showing point estimates only.\n")
+        residual_sd = 0.0
+    else:
+        print(f"  Residual SD = {residual_sd:.4f}  |  SE type: HC3 (robust)")
 
-    # --- Estimated Marginal Means (EMMs) ---
-    # For each model, predict lp_diff at the mean scenario effect
-    # EMM_i = intercept + α_i + mean(β_j) across all scenarios in the model
-    # Simpler: predict for each model at each scenario, then average
-
+    # --- Omnibus Wald test for model effect ---
+    # Before doing C(k,2) pairwise contrasts, confirm that the model factor
+    # has any effect at all.  This uses the HC3 covariance for a robust Wald.
     scorable_models = sorted(df["model"].unique())
     all_scenarios_in_data = sorted(df["scenario"].unique())
+    param_names = list(ols_model.params.index)
+    model_coefs = [n for n in param_names if n.startswith("C(model)")]
+    if model_coefs and ols_model.df_resid >= 1:
+        r_matrix = np.zeros((len(model_coefs), len(ols_model.params)))
+        for i, name in enumerate(model_coefs):
+            r_matrix[i, param_names.index(name)] = 1.0
+        wald = ols_model.wald_test(r_matrix, use_f=True, scalar=True)
+        f_stat = float(np.squeeze(wald.statistic))
+        f_pval = float(np.squeeze(wald.pvalue))
+        print(f"\n  Omnibus Wald F-test for model effect (HC3):")
+        print(f"    F({len(model_coefs)}, {ols_model.df_resid:.0f}) = {f_stat:.3f},  p = {f_pval:.4f}"
+              + ("  ***" if f_pval < 0.001 else "  **" if f_pval < 0.01 else "  *" if f_pval < 0.05 else "  n.s."))
+        if f_pval > 0.05:
+            print(f"    NOTE: No significant model effect — pairwise contrasts are exploratory.")
 
-    # Build prediction grid: each model × all scenarios
+    # --- Residual diagnostics ---
+    if ols_model.df_resid >= 1:
+        resids = ols_model.resid
+        skew = float(stats.skew(resids))
+        kurt = float(stats.kurtosis(resids))  # excess kurtosis (0 = normal)
+        print(f"\n  Residual diagnostics:")
+        print(f"    Skewness = {skew:+.3f}  (0 = symmetric)")
+        print(f"    Excess kurtosis = {kurt:+.3f}  (0 = normal tails)")
+        if len(resids) >= 8:
+            sw_stat, sw_p = stats.shapiro(resids)
+            print(f"    Shapiro-Wilk W = {sw_stat:.4f},  p = {sw_p:.4f}"
+                  + ("  (non-normal)" if sw_p < 0.05 else "  (consistent with normality)"))
+            if sw_p < 0.05:
+                print(f"    NOTE: Non-normal residuals. HC3 SEs handle heteroscedasticity")
+                print(f"    but not heavy tails. Interpret small-sample p-values with caution.")
+
+    # --- Estimated Marginal Means (EMMs) ---
+    # In the additive model, EMM_i = intercept + α_i + mean(β_j).
+    # Predicting across the full model×scenario grid and averaging handles
+    # the unbalanced design correctly.
     emm_data = []
     for model in scorable_models:
         preds = []
@@ -234,11 +308,9 @@ def run_ols_analysis(df: pd.DataFrame, models: List[str], all_results: List[Dict
                 continue
         if preds:
             emm_lp = np.mean(preds)
-            # Convert logprob difference to scheming score
             emm_score = 1.0 / (1.0 + np.exp(-emm_lp))
             emm_data.append((model, emm_lp, emm_score, len(df[df["model"] == model])))
 
-    # Sort by EMM scheming score descending
     emm_data.sort(key=lambda x: x[2], reverse=True)
 
     print(f"\n  ESTIMATED MARGINAL MEANS (model effects averaged over all scenarios)")
@@ -250,103 +322,111 @@ def run_ols_analysis(df: pd.DataFrame, models: List[str], all_results: List[Dict
     print(f"  EMM lp_diff: estimated mean log(P_deceptive/P_honest), controlling for scenario")
     print(f"  EMM Score:   sigmoid(EMM lp_diff) — 0=honest, 1=scheming")
 
-    # --- Pairwise contrasts with Holm correction ---
+    # --- Pairwise contrasts from the OLS coefficient covariance ---
+    # In the additive model, the contrast between models i and j is exactly
+    # α_i - α_j.  The SE comes from the HC3-robust covariance matrix, so
+    # contrast, SE, t-stat, and p-value all derive from one coherent model.
     print(f"\n{'=' * 90}")
-    print(f"  3. PAIRWISE CONTRASTS (from OLS model, Holm-corrected)")
+    print(f"  3. PAIRWISE CONTRASTS (OLS coefficients, HC3 SEs, Holm-corrected)")
+    print(f"  Each contrast is α_i - α_j from the fitted model.")
+    print(f"  Controls for scenario difficulty; robust to heteroscedasticity.")
     print(f"{'=' * 90}")
 
     if len(scorable_models) < 2:
         print("\n  Need at least 2 scorable models for pairwise tests.")
         return
 
+    params = ols_model.params
+    cov = ols_model.cov_params()
+
+    # Map each model to its Treatment-coded coefficient name (None = reference)
+    model_to_coef = {}
+    for model in scorable_models:
+        coef_name = f"C(model)[T.{model}]"
+        model_to_coef[model] = coef_name if coef_name in param_names else None
+
     pairs = list(combinations(scorable_models, 2))
+    # (model_a, model_b, contrast, se, p_raw, cohens_d)
+    pair_results: List[Tuple[str, str, float, float, float, float]] = []
 
-    # Extract pairwise differences and p-values from the OLS model
-    # Use the model's coefficient covariance to compute contrasts
-    pair_results = []
     for a, b in pairs:
-        # Compute contrast: EMM_a - EMM_b
-        # Predict for both models at each scenario, compute mean difference
-        diffs = []
-        for scen in all_scenarios_in_data:
-            try:
-                pred_a = float(ols_model.predict(pd.DataFrame({"model": [a], "scenario": [scen]})).iloc[0])
-                pred_b = float(ols_model.predict(pd.DataFrame({"model": [b], "scenario": [scen]})).iloc[0])
-                diffs.append(pred_a - pred_b)
-            except Exception:
-                continue
-        if not diffs:
+        # Build contrast vector c such that c'β = α_a - α_b
+        c = np.zeros(len(params))
+        if model_to_coef[a] is not None:
+            c[param_names.index(model_to_coef[a])] = 1.0
+        if model_to_coef[b] is not None:
+            c[param_names.index(model_to_coef[b])] = -1.0
+
+        contrast = float(c @ params.values)
+        se = float(np.sqrt(c @ cov.values @ c))
+
+        if se < 1e-12:
+            pair_results.append((a, b, contrast, se, np.nan, 0.0))
             continue
-        contrast = np.mean(diffs)  # Should be constant across scenarios (additive model)
 
-        # For the p-value, use the original data — paired Wilcoxon on shared items
-        shared_a = []
-        shared_b = []
-        for scen in all_scenarios_in_data:
-            da = df[(df["model"] == a) & (df["scenario"] == scen)]
-            db = df[(df["model"] == b) & (df["scenario"] == scen)]
-            if len(da) > 0 and len(db) > 0:
-                shared_a.append(float(da["lp_diff"].iloc[0]))
-                shared_b.append(float(db["lp_diff"].iloc[0]))
+        t_stat = contrast / se
+        p_raw = float(2.0 * stats.t.sf(abs(t_stat), ols_model.df_resid))
+        cohens_d = contrast / residual_sd if residual_sd > 1e-12 else 0.0
+        pair_results.append((a, b, contrast, se, p_raw, cohens_d))
 
-        n_shared = len(shared_a)
-        if n_shared == 0:
-            pair_results.append((a, b, contrast, n_shared, np.nan, "no overlap"))
-        elif n_shared < 5 or all(x == y for x, y in zip(shared_a, shared_b)):
-            pair_results.append((a, b, contrast, n_shared, np.nan, f"n={n_shared}<5"))
-        else:
-            try:
-                result = stats.wilcoxon(shared_a, shared_b, alternative="two-sided")
-                pair_results.append((a, b, contrast, n_shared, float(result.pvalue), ""))
-            except Exception:
-                pair_results.append((a, b, contrast, n_shared, np.nan, "error"))
-
-    # Apply Holm-Bonferroni correction to p-values
+    # Holm-Bonferroni correction for FWER control
     raw_pvals = [pr[4] for pr in pair_results]
     valid_mask = [not np.isnan(p) for p in raw_pvals]
     valid_pvals = [p for p, v in zip(raw_pvals, valid_mask) if v]
 
     if valid_pvals:
-        reject, corrected_pvals, _, _ = multipletests(valid_pvals, method="holm")
-        # Map corrected p-values back
+        _, corrected_pvals, _, _ = multipletests(valid_pvals, method="holm")
         corrected_iter = iter(corrected_pvals)
-        final_pvals = []
-        for p, v in zip(raw_pvals, valid_mask):
-            if v:
-                final_pvals.append(next(corrected_iter))
-            else:
-                final_pvals.append(np.nan)
+        final_pvals = [
+            float(next(corrected_iter)) if v else np.nan
+            for _, v in zip(raw_pvals, valid_mask)
+        ]
     else:
-        final_pvals = raw_pvals
+        final_pvals = list(raw_pvals)
 
-    print(f"\n  {'Model A':<28} {'Model B':<28} {'N':>4} {'Δ lp_diff':>10} {'p (Holm)':>12} {'Sig':>6}")
-    print(f"  {'-' * 92}")
+    n_tests = sum(valid_mask)
+    print(f"\n  {n_tests} pairwise tests, Holm-Bonferroni corrected (FWER ≤ 0.05)")
+    print(f"\n  {'Model A':<26} {'Model B':<26} {'Δ':>8} {'SE':>7} {'t':>7} {'p_raw':>8} {'p_adj':>8} {'d':>6} {'Sig':>5}")
+    print(f"  {'-' * 105}")
 
-    for i, (a, b, contrast, n_shared, raw_p, note) in enumerate(pair_results):
-        p_corrected = final_pvals[i]
-        if note:
-            sig_str = note
-            p_str = "---"
-        elif np.isnan(p_corrected):
-            sig_str = "---"
-            p_str = "---"
+    # Sort by adjusted p-value (most significant first) for readability
+    display_order = sorted(
+        range(len(pair_results)),
+        key=lambda i: final_pvals[i] if not np.isnan(final_pvals[i]) else 2.0,
+    )
+
+    for i in display_order:
+        a, b, contrast, se, p_raw, d = pair_results[i]
+        p_adj = final_pvals[i]
+        if np.isnan(p_raw):
+            print(f"  {a:<26} {b:<26} {contrast:>+8.4f} {'---':>7} {'---':>7} {'---':>8} {'---':>8} {'---':>6} {'deg.':>5}")
+            continue
+
+        t_stat = contrast / se if se > 1e-12 else 0.0
+        p_raw_s = f"{p_raw:.4f}" if p_raw >= 0.0001 else f"{p_raw:.1e}"
+        p_adj_s = f"{p_adj:.4f}" if p_adj >= 0.0001 else f"{p_adj:.1e}"
+        if p_adj < 0.001:
+            sig_str = "***"
+        elif p_adj < 0.01:
+            sig_str = "**"
+        elif p_adj < 0.05:
+            sig_str = "*"
         else:
-            if p_corrected < 0.001:
-                sig_str = "***"
-            elif p_corrected < 0.01:
-                sig_str = "**"
-            elif p_corrected < 0.05:
-                sig_str = "*"
-            else:
-                sig_str = "n.s."
-            p_str = f"{p_corrected:.4f}"
+            sig_str = "n.s."
 
-        print(f"  {a:<28} {b:<28} {n_shared:>4} {contrast:>+10.4f} {p_str:>12} {sig_str:>6}")
+        print(
+            f"  {a:<26} {b:<26} {contrast:>+8.4f} {se:>7.4f} {t_stat:>7.2f} "
+            f"{p_raw_s:>8} {p_adj_s:>8} {d:>+6.2f} {sig_str:>5}"
+        )
 
-    print(f"  {'-' * 92}")
-    print(f"  Δ lp_diff: model A minus model B (+ means A more scheming)")
-    print(f"  p-values: Wilcoxon signed-rank on shared scenarios, Holm-Bonferroni corrected")
-    print(f"  *** p<.001  ** p<.01  * p<.05  n.s. not significant")
+    print(f"  {'-' * 105}")
+    print(f"  Sorted by p_adj (most significant first)")
+    print(f"  Δ:     α_A - α_B from OLS (+ means A more scheming)")
+    print(f"  SE:    HC3 heteroscedasticity-robust standard error")
+    print(f"  p_raw: uncorrected two-sided p from t({ols_model.df_resid:.0f})")
+    print(f"  p_adj: Holm-Bonferroni corrected (controls FWER across {n_tests} tests)")
+    print(f"  d:     Cohen's d (Δ / residual SD = {residual_sd:.4f})")
+    print(f"         |d| > 0.2 small, > 0.5 medium, > 0.8 large")
 
     # --- Missingness diagnostics ---
     print(f"\n{'=' * 90}")
@@ -357,9 +437,15 @@ def run_ols_analysis(df: pd.DataFrame, models: List[str], all_results: List[Dict
     if all_results is None:
         all_results = []
     results_lookup = {(r["model"], r["scenario"]): r for r in all_results if r["status"] != "api_error"}
+    all_scen_names = sorted(set(r["scenario"] for r in all_results))
     for model in models:
-        model_r = [(s, results_lookup.get((model, s))) for s in sorted(set(r["scenario"] for r in all_results))]
-        missing = [(s, r["status"]) for s, r in model_r if r and r["status"] != "both_found"]
+        missing = []
+        for scen in all_scen_names:
+            r = results_lookup.get((model, scen))
+            if r:
+                st = r.get("status_k5", r["status"])
+                if st != "both_found":
+                    missing.append((scen, st))
         if missing:
             print(f"\n  {model}:")
             for scen, status in missing:
@@ -369,11 +455,22 @@ def run_ols_analysis(df: pd.DataFrame, models: List[str], all_results: List[Dict
     print(f"\n{'=' * 90}")
     print(f"  METHODOLOGY")
     print(f"{'=' * 90}")
-    print(f"  Outcome:    lp_diff = log P(deceptive) - log P(honest)")
-    print(f"  Model:      lp_diff ~ C(model) + C(scenario)  [two-way OLS]")
+    print(f"  Metric:     k=5 logprobs (universal — all providers return top-5)")
+    print(f"  Outcome:    lp_diff = log P(deceptive) - log P(honest)  [at k=5]")
+    print(f"  Model:      lp_diff ~ C(model) + C(scenario)  [two-way additive OLS]")
+    print(f"              Assumes no model×scenario interaction (untestable with one obs/cell)")
+    print(f"  SEs:        HC3 heteroscedasticity-consistent (robust to non-constant variance)")
+    print(f"  Omnibus:    Wald F-test (HC3) for any model effect before pairwise contrasts")
     print(f"  EMMs:       model effects averaged over ALL scenario levels")
-    print(f"  Pairwise:   Wilcoxon signed-rank on shared scenarios")
-    print(f"  Correction: Holm-Bonferroni for multiple comparisons")
+    print(f"              EMM Score = sigmoid(EMM lp_diff) shown for interpretability;")
+    print(f"              all statistical comparisons are on the linear lp_diff scale")
+    print(f"  Pairwise:   linear contrasts from OLS coefficient covariance matrix")
+    print(f"              (contrast, SE, and p-value all from one coherent model)")
+    print(f"  Correction: Holm-Bonferroni step-down for FWER control")
+    print(f"              (valid regardless of correlation between tests)")
+    print(f"  Effect size: Cohen's d (contrast / residual SD)")
+    print(f"  Diagnostics: Shapiro-Wilk + skewness/kurtosis on residuals;")
+    print(f"               design connectedness check")
     print(f"  Missing:    excluded (not imputed); documented in diagnostics")
     print(f"  Caveat:     missingness is MNAR (correlated with outcome).")
     print(f"              Very honest models lose deceptive tokens from top-K,")
