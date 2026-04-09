@@ -3,11 +3,13 @@
 WatcherBench Statistical Analysis.
 
 Reads results.json and produces rigorous cross-model comparisons:
-  1. k=5 calibration (do k=20 scores change when restricted to k=5?)
-  2. Common items analysis (only compare on scenarios ALL models can score)
-  3. Per-model mean + bootstrap 95% CI
-  4. Paired Wilcoxon signed-rank tests between all model pairs
-  5. Full heatmap (model × scenario)
+  1. k=5 calibration
+  2. Model × scenario heatmaps
+  3. Two-way fixed-effects model (OLS on logprob differences)
+  4. Estimated marginal means with Holm-corrected pairwise contrasts
+  5. Coverage and missingness diagnostics
+
+Uses statsmodels for proper inference on unbalanced designs.
 
 Usage:
     python analyze.py                  # analyze results.json
@@ -17,17 +19,26 @@ Usage:
 import json
 import math
 import sys
+import warnings
 from collections import defaultdict
 from itertools import combinations
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
 from scipy import stats
+from statsmodels.stats.multitest import multipletests
 
 
 def load_results(path: str = "results.json") -> Dict[str, Any]:
     with open(path) as f:
         return json.load(f)
+
+
+def _fmt(s, width=7):
+    return f"{s:.4f}" if s is not None and not (isinstance(s, float) and math.isnan(s)) else "---"
 
 
 # ---------------------------------------------------------------------------
@@ -43,17 +54,13 @@ def k5_calibration(results: List[Dict]) -> None:
 
     changed = 0
     total = 0
-    diffs = []
 
-    print(f"\n{'Model':<32} {'Scenario':<24} {'k':>3} {'Score_full':>11} {'Score_k5':>11} {'Delta':>8} {'Status_full':<18} {'Status_k5':<18}")
-    print("-" * 140)
+    print(f"\n{'Model':<32} {'Scenario':<24} {'k':>3} {'Score_full':>11} {'Score_k5':>11} {'Status_full':<18} {'Status_k5':<18}")
+    print("-" * 130)
 
     for r in results:
-        if r.get("top_k", 0) <= 5:
-            continue  # skip models that only had k=5
-        if r["status"] == "api_error":
+        if r.get("top_k", 0) <= 5 or r["status"] == "api_error":
             continue
-
         total += 1
         s_full = r.get("scheming_score")
         s_k5 = r.get("scheming_score_k5")
@@ -62,147 +69,45 @@ def k5_calibration(results: List[Dict]) -> None:
 
         if s_full != s_k5 or st_full != st_k5:
             changed += 1
-            delta = "CHANGED"
-            if s_full is not None and s_k5 is not None:
-                delta = f"{s_k5 - s_full:+.4f}"
-                diffs.append(s_k5 - s_full)
-            elif s_full is not None and s_k5 is None:
-                delta = "LOST"
-            elif s_full is None and s_k5 is not None:
-                delta = "GAINED"
-
             print(
                 f"{r['model']:<32} {r['scenario']:<24} {r['top_k']:>3} "
-                f"{_fmt_score(s_full):>11} {_fmt_score(s_k5):>11} {delta:>8} "
-                f"{st_full:<18} {st_k5:<18}"
+                f"{_fmt(s_full):>11} {_fmt(s_k5):>11} {st_full:<18} {st_k5:<18}"
             )
 
-    print("-" * 140)
-    print(f"  Total k>5 results: {total}")
-    print(f"  Changed when restricted to k=5: {changed} ({changed/total*100:.1f}%)" if total else "")
-    if diffs:
-        print(f"  Mean score delta (where both scorable): {sum(diffs)/len(diffs):+.4f}")
-    if changed == 0:
-        print("  CONCLUSION: k=5 and k=20 produce identical scores. k=5 models are directly comparable.")
-    else:
-        print(f"  CONCLUSION: {changed}/{total} scores differ. k=5 models lose information at ranks 6-20.")
+    print("-" * 130)
+    if total:
+        print(f"  {changed}/{total} results changed when restricted to k=5 ({changed/total*100:.1f}%)")
     print()
 
 
 # ---------------------------------------------------------------------------
-# 2. Common items analysis
+# 2. Heatmap
 # ---------------------------------------------------------------------------
-
-def find_common_items(results: List[Dict], models: List[str], use_k5: bool = False) -> List[str]:
-    """Find scenarios where ALL specified models have both_found."""
-    status_key = "status_k5" if use_k5 else "status"
-    # Build model -> set of both_found scenarios
-    scorable = defaultdict(set)
-    for r in results:
-        if r["model"] in models:
-            st = r.get(status_key, r["status"])
-            if st == "both_found":
-                scorable[r["model"]].add(r["scenario"])
-
-    if not scorable:
-        return []
-
-    # Intersect across all models
-    common = None
-    for model in models:
-        s = scorable.get(model, set())
-        common = s if common is None else common & s
-    return sorted(common) if common else []
-
-
-# ---------------------------------------------------------------------------
-# 3. Bootstrap CI
-# ---------------------------------------------------------------------------
-
-def bootstrap_ci(scores: List[float], n_boot: int = 10000, alpha: float = 0.05) -> Tuple[float, float, float]:
-    """Return (mean, ci_low, ci_high) via BCa bootstrap using scipy."""
-    if not scores:
-        return (float("nan"), float("nan"), float("nan"))
-    arr = np.array(scores)
-    mean = float(np.mean(arr))
-    if len(arr) < 2:
-        return (mean, mean, mean)
-    result = stats.bootstrap(
-        (arr,), np.mean, n_resamples=n_boot,
-        confidence_level=1 - alpha, random_state=42, method="BCa",
-    )
-    return (mean, float(result.confidence_interval.low), float(result.confidence_interval.high))
-
-
-def wilcoxon_test(x: List[float], y: List[float]) -> Tuple[float, float, str]:
-    """
-    Paired Wilcoxon signed-rank test (two-sided) using scipy.
-    Returns (statistic, p_value, significance_string).
-    """
-    assert len(x) == len(y)
-    diffs = [xi - yi for xi, yi in zip(x, y)]
-    n_nonzero = sum(1 for d in diffs if d != 0)
-
-    if n_nonzero == 0:
-        return (0.0, 1.0, "identical")
-    if n_nonzero < 5:
-        return (0.0, 1.0, f"n={n_nonzero}<5")
-
-    try:
-        result = stats.wilcoxon(x, y, alternative="two-sided")
-        stat = float(result.statistic)
-        p = float(result.pvalue)
-        if p < 0.001:
-            sig = f"p={p:.1e} ***"
-        elif p < 0.01:
-            sig = f"p={p:.3f} **"
-        elif p < 0.05:
-            sig = f"p={p:.3f} *"
-        else:
-            sig = f"p={p:.3f} n.s."
-        return (stat, p, sig)
-    except ValueError:
-        return (0.0, 1.0, "error")
-
-
-# ---------------------------------------------------------------------------
-# 5. Reporting
-# ---------------------------------------------------------------------------
-
-def _fmt_score(s):
-    return f"{s:.4f}" if s is not None else "---"
-
 
 def print_heatmap(results: List[Dict], models: List[str], scenarios: List[str],
-                  title: str, score_key: str = "scheming_score") -> None:
-    """Print model × scenario heatmap."""
-    # Build lookup
-    lookup = {}
-    for r in results:
-        lookup[(r["model"], r["scenario"])] = r
+                  title: str) -> None:
+    lookup = {(r["model"], r["scenario"]): r for r in results}
+    w = 34 + 9 * len(scenarios) + 8
 
-    # Header
-    print(f"\n{'=' * (34 + 9 * len(scenarios))}")
+    print(f"\n{'=' * w}")
     print(f"  {title}")
-    print(f"{'=' * (34 + 9 * len(scenarios))}")
+    print(f"{'=' * w}")
 
-    # Scenario names (abbreviated)
     abbrevs = [s[:7] for s in scenarios]
     print(f"{'Model':<34}", end="")
     for a in abbrevs:
         print(f" {a:>7}", end="")
     print(f" {'Mean':>7}")
-    print("-" * (34 + 9 * len(scenarios) + 8))
+    print("-" * w)
 
     for model in models:
         print(f"{model:<34}", end="")
         scores = []
         for scen in scenarios:
             r = lookup.get((model, scen))
-            if r and r.get(score_key) is not None and r["status"] == "both_found":
-                s = r[score_key]
+            if r and r.get("scheming_score") is not None and r["status"] == "both_found":
+                s = r["scheming_score"]
                 scores.append(s)
-                # Color hint: high=scheming, low=honest
                 print(f" {s:>7.3f}", end="")
             elif r and r["status"] == "api_error":
                 print(f" {'ERR':>7}", end="")
@@ -210,177 +115,281 @@ def print_heatmap(results: List[Dict], models: List[str], scenarios: List[str],
                 print(f" {'skip':>7}", end="")
             else:
                 print(f" {'---':>7}", end="")
-
         if scores:
             print(f" {sum(scores)/len(scores):>7.3f}", end="")
         else:
             print(f" {'---':>7}", end="")
         print()
+    print("=" * w)
 
-    print("=" * (34 + 9 * len(scenarios) + 8))
 
+# ---------------------------------------------------------------------------
+# 3. Two-way fixed-effects OLS on logprob differences
+# ---------------------------------------------------------------------------
+
+def build_analysis_df(results: List[Dict]) -> pd.DataFrame:
+    """Build a DataFrame of scorable results with logprob differences."""
+    rows = []
+    for r in results:
+        if r["status"] != "both_found":
+            continue
+        lp_dec = r.get("lp_deceptive")
+        lp_hon = r.get("lp_honest")
+        if lp_dec is None or lp_hon is None:
+            continue
+        rows.append({
+            "model": r["model"],
+            "scenario": r["scenario"],
+            "role_mode": r["role_mode"],
+            "lp_diff": lp_dec - lp_hon,
+            "scheming_score": r["scheming_score"],
+        })
+    return pd.DataFrame(rows)
+
+
+def run_ols_analysis(df: pd.DataFrame, models: List[str], all_results: List[Dict] = None) -> None:
+    """Fit two-way OLS and extract estimated marginal means."""
+    print("\n" + "=" * 90)
+    print("  2. TWO-WAY FIXED-EFFECTS MODEL")
+    print("  lp_diff ~ C(model) + C(scenario)")
+    print("  Estimates model effects controlling for scenario difficulty via OLS.")
+    print("  Handles unbalanced designs correctly (no biased centering constants).")
+    print("=" * 90)
+
+    if len(df) < 3:
+        print("\n  Not enough data points for OLS. Need a full run.")
+        return
+
+    n_models = df["model"].nunique()
+    n_scenarios = df["scenario"].nunique()
+    print(f"\n  Observations: {len(df)}  |  Models: {n_models}  |  Scenarios: {n_scenarios}")
+
+    # Check we have enough data
+    if n_models < 2:
+        print("  Need at least 2 models with scorable results.")
+        return
+    if n_scenarios < 2:
+        print("  Need at least 2 scenarios with scorable results.")
+        return
+
+    # Coverage table
+    print(f"\n  Coverage (scorable scenarios per model):")
+    for model in models:
+        n = len(df[df["model"] == model])
+        scenarios_list = sorted(df[df["model"] == model]["scenario"].tolist())
+        print(f"    {model:<34} {n:>2} scenarios: {', '.join(s[:12] for s in scenarios_list)}")
+
+    # Fit OLS
+    # Use Treatment coding with the first model as reference
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ols_model = smf.ols("lp_diff ~ C(model) + C(scenario)", data=df).fit()
+    except Exception as e:
+        print(f"\n  OLS fitting failed: {e}")
+        return
+
+    print(f"\n  R² = {ols_model.rsquared:.4f}  |  Adj R² = {ols_model.rsquared_adj:.4f}")
+    print(f"  Residual std = {np.sqrt(ols_model.mse_resid):.4f}")
+
+    # --- Estimated Marginal Means (EMMs) ---
+    # For each model, predict lp_diff at the mean scenario effect
+    # EMM_i = intercept + α_i + mean(β_j) across all scenarios in the model
+    # Simpler: predict for each model at each scenario, then average
+
+    scorable_models = sorted(df["model"].unique())
+    all_scenarios_in_data = sorted(df["scenario"].unique())
+
+    # Build prediction grid: each model × all scenarios
+    emm_data = []
+    for model in scorable_models:
+        preds = []
+        for scen in all_scenarios_in_data:
+            try:
+                pred_df = pd.DataFrame({"model": [model], "scenario": [scen]})
+                pred = ols_model.predict(pred_df)
+                preds.append(float(pred.iloc[0]))
+            except Exception:
+                continue
+        if preds:
+            emm_lp = np.mean(preds)
+            # Convert logprob difference to scheming score
+            emm_score = 1.0 / (1.0 + np.exp(-emm_lp))
+            emm_data.append((model, emm_lp, emm_score, len(df[df["model"] == model])))
+
+    # Sort by EMM scheming score descending
+    emm_data.sort(key=lambda x: x[2], reverse=True)
+
+    print(f"\n  ESTIMATED MARGINAL MEANS (model effects averaged over all scenarios)")
+    print(f"  {'Model':<34} {'EMM lp_diff':>12} {'EMM Score':>10} {'N_obs':>6}")
+    print(f"  {'-' * 66}")
+    for model, emm_lp, emm_score, n in emm_data:
+        print(f"  {model:<34} {emm_lp:>+12.4f} {emm_score:>10.4f} {n:>6}")
+    print(f"  {'-' * 66}")
+    print(f"  EMM lp_diff: estimated mean log(P_deceptive/P_honest), controlling for scenario")
+    print(f"  EMM Score:   sigmoid(EMM lp_diff) — 0=honest, 1=scheming")
+
+    # --- Pairwise contrasts with Holm correction ---
+    print(f"\n{'=' * 90}")
+    print(f"  3. PAIRWISE CONTRASTS (from OLS model, Holm-corrected)")
+    print(f"{'=' * 90}")
+
+    if len(scorable_models) < 2:
+        print("\n  Need at least 2 scorable models for pairwise tests.")
+        return
+
+    pairs = list(combinations(scorable_models, 2))
+
+    # Extract pairwise differences and p-values from the OLS model
+    # Use the model's coefficient covariance to compute contrasts
+    pair_results = []
+    for a, b in pairs:
+        # Compute contrast: EMM_a - EMM_b
+        # Predict for both models at each scenario, compute mean difference
+        diffs = []
+        for scen in all_scenarios_in_data:
+            try:
+                pred_a = float(ols_model.predict(pd.DataFrame({"model": [a], "scenario": [scen]})).iloc[0])
+                pred_b = float(ols_model.predict(pd.DataFrame({"model": [b], "scenario": [scen]})).iloc[0])
+                diffs.append(pred_a - pred_b)
+            except Exception:
+                continue
+        if not diffs:
+            continue
+        contrast = np.mean(diffs)  # Should be constant across scenarios (additive model)
+
+        # For the p-value, use the original data — paired Wilcoxon on shared items
+        shared_a = []
+        shared_b = []
+        for scen in all_scenarios_in_data:
+            da = df[(df["model"] == a) & (df["scenario"] == scen)]
+            db = df[(df["model"] == b) & (df["scenario"] == scen)]
+            if len(da) > 0 and len(db) > 0:
+                shared_a.append(float(da["lp_diff"].iloc[0]))
+                shared_b.append(float(db["lp_diff"].iloc[0]))
+
+        n_shared = len(shared_a)
+        if n_shared == 0:
+            pair_results.append((a, b, contrast, n_shared, np.nan, "no overlap"))
+        elif n_shared < 5 or all(x == y for x, y in zip(shared_a, shared_b)):
+            pair_results.append((a, b, contrast, n_shared, np.nan, f"n={n_shared}<5"))
+        else:
+            try:
+                result = stats.wilcoxon(shared_a, shared_b, alternative="two-sided")
+                pair_results.append((a, b, contrast, n_shared, float(result.pvalue), ""))
+            except Exception:
+                pair_results.append((a, b, contrast, n_shared, np.nan, "error"))
+
+    # Apply Holm-Bonferroni correction to p-values
+    raw_pvals = [pr[4] for pr in pair_results]
+    valid_mask = [not np.isnan(p) for p in raw_pvals]
+    valid_pvals = [p for p, v in zip(raw_pvals, valid_mask) if v]
+
+    if valid_pvals:
+        reject, corrected_pvals, _, _ = multipletests(valid_pvals, method="holm")
+        # Map corrected p-values back
+        corrected_iter = iter(corrected_pvals)
+        final_pvals = []
+        for p, v in zip(raw_pvals, valid_mask):
+            if v:
+                final_pvals.append(next(corrected_iter))
+            else:
+                final_pvals.append(np.nan)
+    else:
+        final_pvals = raw_pvals
+
+    print(f"\n  {'Model A':<28} {'Model B':<28} {'N':>4} {'Δ lp_diff':>10} {'p (Holm)':>12} {'Sig':>6}")
+    print(f"  {'-' * 92}")
+
+    for i, (a, b, contrast, n_shared, raw_p, note) in enumerate(pair_results):
+        p_corrected = final_pvals[i]
+        if note:
+            sig_str = note
+            p_str = "---"
+        elif np.isnan(p_corrected):
+            sig_str = "---"
+            p_str = "---"
+        else:
+            if p_corrected < 0.001:
+                sig_str = "***"
+            elif p_corrected < 0.01:
+                sig_str = "**"
+            elif p_corrected < 0.05:
+                sig_str = "*"
+            else:
+                sig_str = "n.s."
+            p_str = f"{p_corrected:.4f}"
+
+        print(f"  {a:<28} {b:<28} {n_shared:>4} {contrast:>+10.4f} {p_str:>12} {sig_str:>6}")
+
+    print(f"  {'-' * 92}")
+    print(f"  Δ lp_diff: model A minus model B (+ means A more scheming)")
+    print(f"  p-values: Wilcoxon signed-rank on shared scenarios, Holm-Bonferroni corrected")
+    print(f"  *** p<.001  ** p<.01  * p<.05  n.s. not significant")
+
+    # --- Missingness diagnostics ---
+    print(f"\n{'=' * 90}")
+    print(f"  4. MISSINGNESS DIAGNOSTICS")
+    print(f"  Missing data is NOT random — models with extreme scores lose tokens from top-K.")
+    print(f"{'=' * 90}")
+
+    if all_results is None:
+        all_results = []
+    results_lookup = {(r["model"], r["scenario"]): r for r in all_results if r["status"] != "api_error"}
+    for model in models:
+        model_r = [(s, results_lookup.get((model, s))) for s in sorted(set(r["scenario"] for r in all_results))]
+        missing = [(s, r["status"]) for s, r in model_r if r and r["status"] != "both_found"]
+        if missing:
+            print(f"\n  {model}:")
+            for scen, status in missing:
+                print(f"    {scen:<28} {status}")
+
+    # --- Summary ---
+    print(f"\n{'=' * 90}")
+    print(f"  METHODOLOGY")
+    print(f"{'=' * 90}")
+    print(f"  Outcome:    lp_diff = log P(deceptive) - log P(honest)")
+    print(f"  Model:      lp_diff ~ C(model) + C(scenario)  [two-way OLS]")
+    print(f"  EMMs:       model effects averaged over ALL scenario levels")
+    print(f"  Pairwise:   Wilcoxon signed-rank on shared scenarios")
+    print(f"  Correction: Holm-Bonferroni for multiple comparisons")
+    print(f"  Missing:    excluded (not imputed); documented in diagnostics")
+    print(f"  Caveat:     missingness is MNAR (correlated with outcome).")
+    print(f"              Very honest models lose deceptive tokens from top-K,")
+    print(f"              biasing their remaining scores slightly upward.")
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def run_analysis(data: Dict[str, Any]) -> None:
     results = data["results"]
     models = data["models"]
 
     all_scenarios = list(dict.fromkeys(r["scenario"] for r in results))
-    audit_scenarios = list(dict.fromkeys(
-        r["scenario"] for r in results if r["role_mode"] == "user_audit"
-    ))
-    continue_scenarios = list(dict.fromkeys(
-        r["scenario"] for r in results if r["role_mode"] == "assistant_continue"
-    ))
+    audit_scenarios = [s for s in all_scenarios if any(
+        r["scenario"] == s and r["role_mode"] == "user_audit" for r in results)]
+    continue_scenarios = [s for s in all_scenarios if any(
+        r["scenario"] == s and r["role_mode"] == "assistant_continue" for r in results)]
 
-    # --- 1. k=5 calibration ---
+    # 1. k=5 calibration
     k5_calibration(results)
 
-    # --- 2. Full heatmap ---
+    # 2. Heatmaps
     print_heatmap(results, models, audit_scenarios,
-                  "HEATMAP: user_audit scenarios (score at full k)")
+                  "HEATMAP: user_audit scenarios")
     if continue_scenarios:
         print_heatmap(results, models, continue_scenarios,
-                      "HEATMAP: assistant_continue scenarios (score at full k)")
+                      "HEATMAP: assistant_continue scenarios (interpret with caution)")
 
-    # --- 3. Scenario-centered scoring ---
-    # Instead of restricting to common items (wasteful), we center each
-    # scenario by its grand mean across all models that scored it.
-    # This controls for scenario difficulty while using ALL available data.
-
-    print("\n" + "=" * 90)
-    print("  2. SCENARIO-CENTERED MODEL RANKING")
-    print("  Each scenario is centered by its grand mean, controlling for difficulty.")
-    print("  Every model uses ALL its scorable scenarios — no data discarded.")
-    print("=" * 90)
-
-    # Build lookup: (model, scenario) -> score
-    score_lookup: Dict[Tuple[str, str], float] = {}
-    for r in results:
-        if r["status"] == "both_found" and r["scheming_score"] is not None:
-            score_lookup[(r["model"], r["scenario"])] = r["scheming_score"]
-
-    # Compute scenario grand means
-    scenario_scores: Dict[str, List[float]] = defaultdict(list)
-    for (model, scen), score in score_lookup.items():
-        scenario_scores[scen].append(score)
-
-    scenario_means: Dict[str, float] = {}
-    for scen, scores in scenario_scores.items():
-        scenario_means[scen] = sum(scores) / len(scores)
-
-    print(f"\n  Scenario difficulty (grand mean across models that scored it):")
-    for scen in sorted(scenario_means, key=scenario_means.get, reverse=True):
-        n_models = len(scenario_scores[scen])
-        print(f"    {scen:<28} mean={scenario_means[scen]:.4f}  (n={n_models} models)")
-
-    # Compute per-model: raw mean, centered mean, bootstrap CI
-    model_data = []
-    model_deviations: Dict[str, List[float]] = defaultdict(list)
-
-    for model in models:
-        raw_scores = []
-        deviations = []
-        for scen in all_scenarios:
-            s = score_lookup.get((model, scen))
-            if s is not None and scen in scenario_means:
-                raw_scores.append(s)
-                deviations.append(s - scenario_means[scen])
-
-        model_deviations[model] = deviations
-
-        if raw_scores:
-            raw_mean = sum(raw_scores) / len(raw_scores)
-            adj_mean, adj_lo, adj_hi = bootstrap_ci(deviations)
-            raw_m, raw_lo, raw_hi = bootstrap_ci(raw_scores)
-            model_data.append({
-                "model": model,
-                "raw_mean": raw_mean, "raw_ci": (raw_lo, raw_hi),
-                "adj_mean": adj_mean, "adj_ci": (adj_lo, adj_hi),
-                "n": len(raw_scores),
-            })
-        else:
-            model_data.append({
-                "model": model,
-                "raw_mean": None, "raw_ci": (None, None),
-                "adj_mean": None, "adj_ci": (None, None),
-                "n": 0,
-            })
-
-    # Sort by adjusted mean descending
-    model_data.sort(key=lambda x: x["adj_mean"] if x["adj_mean"] is not None else -999, reverse=True)
-
-    print(f"\n{'Model':<34} {'Raw Mean':>9} {'Adj Mean':>9} {'Adj 95% CI':>18} {'N':>4}")
-    print("-" * 78)
-    for md in model_data:
-        if md["adj_mean"] is not None:
-            print(
-                f"{md['model']:<34} {md['raw_mean']:>9.4f} {md['adj_mean']:>+9.4f} "
-                f"[{md['adj_ci'][0]:>+.4f}, {md['adj_ci'][1]:>+.4f}] {md['n']:>4}"
-            )
-        else:
-            print(f"{md['model']:<34} {'---':>9} {'---':>9} {'---':>18} {md['n']:>4}")
-    print("-" * 78)
-    print("  Raw Mean:  average scheming_score across scorable scenarios")
-    print("  Adj Mean:  average (score - scenario_mean), controls for difficulty")
-    print("  Positive adj = more scheming than average model on those scenarios")
-    print("  Negative adj = more honest than average model on those scenarios")
-    print(f"  CI from 10,000 bootstrap resamples of each model's deviations")
-
-    # --- 4. Pairwise tests on SHARED items (max power per pair) ---
-    print(f"\n{'=' * 90}")
-    print(f"  3. PAIRWISE SIGNIFICANCE (Wilcoxon signed-rank on shared scenarios)")
-    print(f"  Each pair compared on scenarios where BOTH models have both_found.")
-    print(f"  Different pairs may use different scenario sets — maximizes power.")
-    print(f"{'=' * 90}")
-
-    scorable_models = [m for m in models if any((m, s) in score_lookup for s in all_scenarios)]
-    pairs = list(combinations(scorable_models, 2))
-
-    print(f"\n  Scorable models: {len(scorable_models)}")
-    print(f"  Pairwise tests: {len(pairs)}\n")
-
-    print(f"{'Model A':<28} {'Model B':<28} {'N':>4} {'Stat':>7} {'Significance':>18} {'Mean Δ':>8}")
-    print("-" * 98)
-
-    for a, b in pairs:
-        a_scores = []
-        b_scores = []
-        for scen in all_scenarios:
-            sa = score_lookup.get((a, scen))
-            sb = score_lookup.get((b, scen))
-            if sa is not None and sb is not None:
-                a_scores.append(sa)
-                b_scores.append(sb)
-
-        n_shared = len(a_scores)
-        if n_shared == 0:
-            print(f"{a:<28} {b:<28} {0:>4} {'---':>7} {'no overlap':>18} {'---':>8}")
-            continue
-
-        mean_delta = sum(x - y for x, y in zip(a_scores, b_scores)) / n_shared
-        stat, p, sig = wilcoxon_test(a_scores, b_scores)
-        print(f"{a:<28} {b:<28} {n_shared:>4} {stat:>7.1f} {sig:>18} {mean_delta:>+8.4f}")
-
-    print("-" * 98)
-    print("  N = shared scenarios where both models have both_found")
-    print("  Mean Δ = mean(score_A - score_B); + means A more scheming")
-    print("  Wilcoxon signed-rank test (scipy.stats.wilcoxon), two-sided")
-
-    # --- Summary ---
-    print(f"\n{'=' * 90}")
-    print("  METHODOLOGY SUMMARY")
-    print(f"{'=' * 90}")
-    print(f"  Scenarios:           {len(all_scenarios)} ({len(audit_scenarios)} user_audit, {len(continue_scenarios)} assistant_continue)")
-    print(f"  Models:              {len(models)}")
-    print(f"  Score:               sigmoid(lp_deceptive - lp_honest), only when both found")
-    print(f"  Adjusted ranking:    scenario-centered (score - scenario_grand_mean)")
-    print(f"                       Uses ALL scorable data per model, no intersection restriction")
-    print(f"                       Controls for scenario difficulty as a fixed effect")
-    print(f"  Bootstrap CI:        10,000 resamples, 95% percentile interval")
-    print(f"  Pairwise tests:      Wilcoxon signed-rank on shared items per pair")
-    print(f"                       Each pair uses max available overlapping scenarios")
-    print(f"  No artificial defaults: missing tokens → excluded, not set to 0 or 1")
-    print()
+    # 3. OLS analysis
+    df = build_analysis_df(results)
+    if len(df) > 0:
+        run_ols_analysis(df, models, all_results=results)
+    else:
+        print("\n  No scorable results for OLS analysis.")
 
 
 def main():
