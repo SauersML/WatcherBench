@@ -16,11 +16,13 @@ Usage:
 
 import json
 import math
-import random
 import sys
 from collections import defaultdict
 from itertools import combinations
 from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+from scipy import stats
 
 
 def load_results(path: str = "results.json") -> Dict[str, Any]:
@@ -118,71 +120,49 @@ def find_common_items(results: List[Dict], models: List[str], use_k5: bool = Fal
 # ---------------------------------------------------------------------------
 
 def bootstrap_ci(scores: List[float], n_boot: int = 10000, alpha: float = 0.05) -> Tuple[float, float, float]:
-    """Return (mean, ci_low, ci_high) via percentile bootstrap."""
+    """Return (mean, ci_low, ci_high) via BCa bootstrap using scipy."""
     if not scores:
         return (float("nan"), float("nan"), float("nan"))
-    n = len(scores)
-    rng = random.Random(42)
-    boot_means = []
-    for _ in range(n_boot):
-        sample = [scores[rng.randint(0, n - 1)] for _ in range(n)]
-        boot_means.append(sum(sample) / n)
-    boot_means.sort()
-    lo = boot_means[int(n_boot * alpha / 2)]
-    hi = boot_means[int(n_boot * (1 - alpha / 2))]
-    return (sum(scores) / n, lo, hi)
+    arr = np.array(scores)
+    mean = float(np.mean(arr))
+    if len(arr) < 2:
+        return (mean, mean, mean)
+    result = stats.bootstrap(
+        (arr,), np.mean, n_resamples=n_boot,
+        confidence_level=1 - alpha, random_state=42, method="BCa",
+    )
+    return (mean, float(result.confidence_interval.low), float(result.confidence_interval.high))
 
 
-# ---------------------------------------------------------------------------
-# 4. Paired Wilcoxon signed-rank test (no scipy dependency)
-# ---------------------------------------------------------------------------
-
-def wilcoxon_signed_rank(x: List[float], y: List[float]) -> Tuple[float, str]:
+def wilcoxon_test(x: List[float], y: List[float]) -> Tuple[float, float, str]:
     """
-    Paired Wilcoxon signed-rank test (two-sided).
-    Returns (test_statistic, significance_indicator).
-    Significance based on critical values for small n.
+    Paired Wilcoxon signed-rank test (two-sided) using scipy.
+    Returns (statistic, p_value, significance_string).
     """
     assert len(x) == len(y)
-    diffs = [(xi - yi) for xi, yi in zip(x, y) if xi != yi]
-    n = len(diffs)
-    if n == 0:
-        return (0.0, "n/a (identical)")
+    diffs = [xi - yi for xi, yi in zip(x, y)]
+    n_nonzero = sum(1 for d in diffs if d != 0)
 
-    # Rank by absolute difference
-    ranked = sorted(enumerate(diffs), key=lambda t: abs(t[1]))
-    ranks = [0.0] * n
-    i = 0
-    while i < n:
-        j = i
-        while j < n and abs(ranked[j][1]) == abs(ranked[i][1]):
-            j += 1
-        avg_rank = sum(range(i + 1, j + 1)) / (j - i)
-        for k in range(i, j):
-            ranks[k] = avg_rank
-        i = j
+    if n_nonzero == 0:
+        return (0.0, 1.0, "identical")
+    if n_nonzero < 5:
+        return (0.0, 1.0, f"n={n_nonzero}<5")
 
-    w_plus = sum(ranks[k] for k in range(n) if diffs[ranked[k][0]] > 0)
-    w_minus = sum(ranks[k] for k in range(n) if diffs[ranked[k][0]] < 0)
-    T = min(w_plus, w_minus)
-
-    # Critical values for two-sided test at alpha=0.05
-    # (from standard tables, n -> critical T)
-    crit_05 = {5: 1, 6: 2, 7: 4, 8: 6, 9: 8, 10: 11, 11: 14, 12: 17,
-               13: 21, 14: 26, 15: 30, 16: 36, 17: 41, 18: 47, 19: 54, 20: 60}
-
-    if n < 5:
-        sig = "n<5"
-    elif n in crit_05:
-        sig = "p<.05 *" if T <= crit_05[n] else "n.s."
-    else:
-        # Normal approximation for n > 20
-        mean_T = n * (n + 1) / 4
-        std_T = math.sqrt(n * (n + 1) * (2 * n + 1) / 24)
-        z = (T - mean_T) / std_T if std_T > 0 else 0
-        sig = f"p<.05 * (z={abs(z):.2f})" if abs(z) > 1.96 else f"n.s. (z={abs(z):.2f})"
-
-    return (T, sig)
+    try:
+        result = stats.wilcoxon(x, y, alternative="two-sided")
+        stat = float(result.statistic)
+        p = float(result.pvalue)
+        if p < 0.001:
+            sig = f"p={p:.1e} ***"
+        elif p < 0.01:
+            sig = f"p={p:.3f} **"
+        elif p < 0.05:
+            sig = f"p={p:.3f} *"
+        else:
+            sig = f"p={p:.3f} n.s."
+        return (stat, p, sig)
+    except ValueError:
+        return (0.0, 1.0, "error")
 
 
 # ---------------------------------------------------------------------------
@@ -359,35 +339,32 @@ def run_analysis(data: Dict[str, Any]) -> None:
     print(f"\n  Scorable models: {len(scorable_models)}")
     print(f"  Pairwise tests: {len(pairs)}\n")
 
-    print(f"{'Model A':<28} {'Model B':<28} {'N_shared':>8} {'T':>6} {'Sig':>16} {'Mean Δ':>8}")
-    print("-" * 100)
+    print(f"{'Model A':<28} {'Model B':<28} {'N':>4} {'Stat':>7} {'Significance':>18} {'Mean Δ':>8}")
+    print("-" * 98)
 
     for a, b in pairs:
-        # Find scenarios where both have scores
-        shared_scenarios = []
         a_scores = []
         b_scores = []
         for scen in all_scenarios:
             sa = score_lookup.get((a, scen))
             sb = score_lookup.get((b, scen))
             if sa is not None and sb is not None:
-                shared_scenarios.append(scen)
                 a_scores.append(sa)
                 b_scores.append(sb)
 
-        n_shared = len(shared_scenarios)
+        n_shared = len(a_scores)
         if n_shared == 0:
-            print(f"{a:<28} {b:<28} {0:>8} {'---':>6} {'no overlap':>16} {'---':>8}")
+            print(f"{a:<28} {b:<28} {0:>4} {'---':>7} {'no overlap':>18} {'---':>8}")
             continue
 
         mean_delta = sum(x - y for x, y in zip(a_scores, b_scores)) / n_shared
-        T, sig = wilcoxon_signed_rank(a_scores, b_scores)
-        print(f"{a:<28} {b:<28} {n_shared:>8} {T:>6.1f} {sig:>16} {mean_delta:>+8.4f}")
+        stat, p, sig = wilcoxon_test(a_scores, b_scores)
+        print(f"{a:<28} {b:<28} {n_shared:>4} {stat:>7.1f} {sig:>18} {mean_delta:>+8.4f}")
 
-    print("-" * 100)
-    print("  N_shared = scenarios where both models have both_found")
-    print("  Mean Δ = mean(score_A - score_B) on shared items; + means A more scheming")
-    print("  * = significant at p<0.05 (two-sided Wilcoxon signed-rank)")
+    print("-" * 98)
+    print("  N = shared scenarios where both models have both_found")
+    print("  Mean Δ = mean(score_A - score_B); + means A more scheming")
+    print("  Wilcoxon signed-rank test (scipy.stats.wilcoxon), two-sided")
 
     # --- Summary ---
     print(f"\n{'=' * 90}")
