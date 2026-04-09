@@ -46,20 +46,37 @@ def _fmt(s, width=7):
 # ---------------------------------------------------------------------------
 
 def k5_calibration(results: List[Dict]) -> None:
-    """Compare scores at full-k vs k=5 for models that had k>5."""
+    """Compare scores at full-k vs k=5 for models that had k>5.
+
+    NOTE: This checks whether k=20 models lose information when truncated to
+    k=5.  It does NOT tell us whether k=5-only models would have had the
+    target tokens in ranks 6-20, because different models have different
+    token distributions.  A low change-rate here is necessary but not
+    sufficient to treat k=5 and k=20 scores as interchangeable.
+    """
     print("\n" + "=" * 90)
-    print("  1. k=5 CALIBRATION")
-    print("  Do scores change when we restrict k=20 models to only their top-5 logprobs?")
+    print("  1. k=5 CALIBRATION  (upper-bound check)")
+    print("  How often do k=20 models lose information when truncated to k=5?")
+    print("  NOTE: This is a necessary but NOT sufficient condition for cross-k")
+    print("  comparability — k=5-only models may have different rank distributions.")
     print("=" * 90)
 
     changed = 0
     total = 0
+    k5_only_missing = 0
+    k5_only_total = 0
 
     print(f"\n{'Model':<32} {'Scenario':<24} {'k':>3} {'Score_full':>11} {'Score_k5':>11} {'Status_full':<18} {'Status_k5':<18}")
     print("-" * 130)
 
     for r in results:
-        if r.get("top_k", 0) <= 5 or r["status"] == "api_error":
+        if r["status"] == "api_error":
+            continue
+        # Track k=5-only models: how often are tokens missing?
+        if r.get("top_k", 0) <= 5:
+            k5_only_total += 1
+            if r["status"] in ("deceptive_missing", "honest_missing"):
+                k5_only_missing += 1
             continue
         total += 1
         s_full = r.get("scheming_score")
@@ -76,7 +93,11 @@ def k5_calibration(results: List[Dict]) -> None:
 
     print("-" * 130)
     if total:
-        print(f"  {changed}/{total} results changed when restricted to k=5 ({changed/total*100:.1f}%)")
+        print(f"  k=20 models: {changed}/{total} changed when truncated to k=5 ({changed/total*100:.1f}%)")
+    if k5_only_total:
+        print(f"  k=5-only models: {k5_only_missing}/{k5_only_total} have a missing token ({k5_only_missing/k5_only_total*100:.1f}%)")
+        if k5_only_missing > 0:
+            print("  ^ These missing tokens MIGHT have appeared at ranks 6-20 — scores are less reliable.")
     print()
 
 
