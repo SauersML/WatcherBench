@@ -339,13 +339,19 @@ def _estimate_logprobs_by_sampling(
     scenario_name: str,
     target_tokens: List[str],
 ) -> Optional[Any]:
-    """Sample N times at T=1, classify each response, build synthetic logprobs.
+    """Sample N times at T=1, classify by first word, build synthetic logprobs.
 
-    Claude often responds with full sentences ("I reviewed the papers and…")
-    instead of bare Yes/No.  Native logprobs would still show the probability
-    mass on "Yes"/"No" at position 0, but sampling only reveals what the model
-    actually generates.  To compensate, we scan the *entire* response for the
-    first word matching a target token, so "I would say No" counts as "no".
+    To be comparable with native top-K logprobs (which report P(first_token)),
+    we match ONLY the first word of each response.  At T=1 the sampling
+    distribution equals the model's actual next-token distribution, so
+    frequency → probability as N → ∞.  This makes the estimated lp_diff
+    directly comparable to native-logprob lp_diff in the OLS.
+
+    The denominator is total matched (= count_dec + count_hon).  This is
+    equivalent to conditioning on "model produced a target token first" —
+    the same conditioning native logprobs apply implicitly (tokens outside
+    top-K are invisible).  Crucially, the denominator cancels in lp_diff:
+      log(count_dec/matched) - log(count_hon/matched) = log(count_dec/count_hon)
 
     Returns a response-shaped object compatible with evaluate_scenario.
     """
@@ -376,20 +382,17 @@ def _estimate_logprobs_by_sampling(
         try:
             resp = _api_call_with_retry(client, **kwargs)
             content = resp.choices[0].message.content if resp.choices else None
-            if content:
-                # Scan first 10 words for a target-token match.
-                # Limiting the window avoids conflating incidental mentions
-                # deep in a response with the model's actual answer.
-                matched = None
-                for word in content.split()[:10]:
-                    canonical = _normalize_sampled_token(word)
-                    if canonical in canonical_targets:
-                        matched = canonical
-                        break
-                if matched:
-                    raw_counts[matched] += 1
+            if content and content.strip():
+                # Match ONLY the first word — this estimates P(first_token)
+                # which is the same quantity native logprobs measure.
+                first_word = content.strip().split()[0]
+                canonical = _normalize_sampled_token(first_word)
+                if canonical in canonical_targets:
+                    raw_counts[canonical] += 1
                 else:
                     unmatched += 1
+            else:
+                unmatched += 1
         except Exception as e:
             log("WARN", f"Sample {i+1}/{n} failed for {model}", error=str(e))
 
@@ -399,8 +402,8 @@ def _estimate_logprobs_by_sampling(
             unmatched=unmatched)
         return None
 
-    # Build synthetic top_logprobs from aggregated counts
-    # Only count matched responses in the denominator (unmatched are discarded)
+    # Build synthetic top_logprobs from aggregated counts.
+    # Denominator = matched total (cancels in lp_diff; see docstring).
     top_logprobs = []
     for token, count in raw_counts.most_common(20):
         top_logprobs.append(SimpleNamespace(token=token, logprob=math.log(count / total)))

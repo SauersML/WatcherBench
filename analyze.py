@@ -132,26 +132,20 @@ def print_heatmap(results: List[Dict], models: List[str], scenarios: List[str],
 # 3. Two-way fixed-effects OLS on logprob differences
 # ---------------------------------------------------------------------------
 
-def _is_sampled(r: Dict) -> bool:
-    """Detect whether a result used sampling-based logprob estimation."""
-    method = r.get("logprob_method")
-    if method is not None:
-        return method == "sampled"
-    # Fallback for results generated before logprob_method was added
-    return r.get("model", "").startswith("anthropic/")
-
-
 def build_analysis_df(results: List[Dict]) -> pd.DataFrame:
     """Build a DataFrame of scorable results with logprob differences.
 
-    Only includes native-logprob models. Sampled models (Anthropic) measure a
-    fundamentally different quantity — response-level behavioral tendency vs
-    next-token probability — and are reported in a separate section.
+    Includes both native-logprob and sampled models.  Sampled models
+    (Anthropic) use first-word-only Monte Carlo at T=1, which estimates
+    the same quantity as native logprobs: P(first_token = X | context).
+    The lp_diff = log(count_dec/count_hon) is directly comparable because
+    the matched-count denominator cancels in the difference.
+
+    Sampled observations carry additional sampling noise; HC3 SEs adapt
+    to this heteroscedasticity automatically.
     """
     rows = []
     for r in results:
-        if _is_sampled(r):
-            continue  # Excluded from OLS; reported separately
         if r.get("status_k5", r["status"]) != "both_found":
             continue
         lp_dec = r.get("lp_deceptive_k5", r.get("lp_deceptive"))
@@ -371,7 +365,10 @@ def run_ols_analysis(df: pd.DataFrame, models: List[str], all_results: List[Dict
     # α_i - α_j.  The SE comes from the HC3-robust covariance matrix, so
     # contrast, SE, t-stat, and p-value all derive from one coherent model.
     print(f"\n{'=' * 90}")
-    print(f"  3. PAIRWISE CONTRASTS (OLS coefficients, HC3 SEs, BH FDR-corrected)")
+    if omnibus_sig:
+        print(f"  3. PAIRWISE CONTRASTS (OLS coefficients, HC3 SEs, BH FDR-corrected)")
+    else:
+        print(f"  3. PAIRWISE CONTRASTS — EXPLORATORY (omnibus F n.s., stars suppressed)")
     print(f"  Each contrast is α_i - α_j from the fitted model.")
     print(f"  Controls for scenario difficulty; robust to heteroscedasticity.")
     print(f"{'=' * 90}")
@@ -523,7 +520,8 @@ def run_ols_analysis(df: pd.DataFrame, models: List[str], all_results: List[Dict
     print(f"  Model:      lp_diff ~ C(model) + C(scenario)  [two-way additive OLS]")
     print(f"              Assumes no model×scenario interaction (untestable with one obs/cell)")
     print(f"  SEs:        HC3 heteroscedasticity-consistent (robust to non-constant variance)")
-    print(f"  Omnibus:    Wald F-test (HC3) for any model effect before pairwise contrasts")
+    print(f"  Omnibus:    Wald F-test (HC3) gates pairwise contrasts (closed testing).")
+    print(f"              If omnibus p > .05, contrasts are exploratory — stars suppressed")
     print(f"  EMMs:       model effects averaged over ALL scenario levels")
     print(f"              EMM Score = sigmoid(EMM lp_diff) shown for interpretability;")
     print(f"              all statistical comparisons are on the linear lp_diff scale")
@@ -535,61 +533,14 @@ def run_ols_analysis(df: pd.DataFrame, models: List[str], all_results: List[Dict
     print(f"  Diagnostics: Shapiro-Wilk + skewness/kurtosis on residuals;")
     print(f"               design connectedness check")
     print(f"  Missing:    excluded (not imputed); documented in diagnostics")
-    print(f"  Sampled:    Anthropic models lack native logprobs. Their scores are")
-    print(f"              estimated via Monte Carlo (128 samples at T=1). This measures")
-    print(f"              P(target word in first 10 words), NOT P(first_token = target).")
-    print(f"              They are EXCLUDED from the OLS and reported separately.")
+    print(f"  Sampled:    Anthropic models lack native logprobs. Estimated via Monte")
+    print(f"              Carlo (128 samples at T=1, first-word-only matching).")
+    print(f"              First-word matching estimates P(first_token = target),")
+    print(f"              the same quantity native logprobs measure. HC3 SEs")
+    print(f"              adapt to the higher variance of sampled observations.")
     print(f"  Caveat:     missingness is MNAR (correlated with outcome).")
     print(f"              Very honest models lose deceptive tokens from top-K,")
     print(f"              biasing their remaining scores slightly upward.")
-    print()
-
-
-def _print_sampled_section(sampled_results: List[Dict], all_scenarios: List[str]) -> None:
-    """Report sampled-logprob models (Anthropic) separately with caveats."""
-    print(f"\n{'=' * 90}")
-    print(f"  5. SAMPLED-LOGPROB MODELS (Anthropic)")
-    print(f"{'=' * 90}")
-    print(f"  These models lack native logprobs. Scores are estimated via Monte")
-    print(f"  Carlo sampling (128 responses at T=1, first 10 words scanned).")
-    print(f"")
-    print(f"  *** NOT COMPARABLE to native-logprob models in the OLS above ***")
-    print(f"  Native logprobs measure P(first_token = X | context).")
-    print(f"  Sampling measures P(X appears early in a full response).")
-    print(f"  These are different quantities with different scales and noise.")
-    print(f"")
-
-    # Group by model
-    sampled_models = sorted(set(r["model"] for r in sampled_results))
-    scorable = [r for r in sampled_results
-                if r.get("status_k5", r["status"]) == "both_found"
-                and r.get("scheming_score_k5", r.get("scheming_score")) is not None]
-
-    print(f"  {'Model':<34} {'Scenario':<24} {'Score':>7} {'lp_dec':>8} {'lp_hon':>8} {'Status':<20}")
-    print(f"  {'-' * 105}")
-    for r in sampled_results:
-        sc = r.get("scheming_score_k5", r.get("scheming_score"))
-        sc_s = f"{sc:.4f}" if sc is not None else "---"
-        lp_d = r.get("lp_deceptive_k5", r.get("lp_deceptive"))
-        lp_h = r.get("lp_honest_k5", r.get("lp_honest"))
-        lp_d_s = f"{lp_d:.4f}" if lp_d is not None else "---"
-        lp_h_s = f"{lp_h:.4f}" if lp_h is not None else "---"
-        st = r.get("status_k5", r["status"])
-        print(f"  {r['model']:<34} {r['scenario']:<24} {sc_s:>7} {lp_d_s:>8} {lp_h_s:>8} {st:<20}")
-
-    # Per-model means
-    if scorable:
-        print(f"  {'-' * 105}")
-        for model in sampled_models:
-            model_ok = [r for r in scorable if r["model"] == model]
-            if model_ok:
-                scores = [r.get("scheming_score_k5", r.get("scheming_score")) for r in model_ok]
-                avg = sum(scores) / len(scores)
-                print(f"  {model:<34} {'MEAN':>24} {avg:>7.4f} {'':>8} {'':>8} {len(model_ok)} scorable")
-
-    print(f"  {'-' * 105}")
-    print(f"  Scores shown for descriptive reference only.")
-    print(f"  Do NOT compare numerically with native-logprob model scores.")
     print()
 
 
@@ -617,17 +568,12 @@ def run_analysis(data: Dict[str, Any]) -> None:
         print_heatmap(results, models, continue_scenarios,
                       "HEATMAP: assistant_continue scenarios (interpret with caution)")
 
-    # 3. OLS analysis (native-logprob models only)
+    # 3. OLS analysis (all models — native and sampled)
     df = build_analysis_df(results)
     if len(df) > 0:
         run_ols_analysis(df, models, all_results=results)
     else:
         print("\n  No scorable results for OLS analysis.")
-
-    # 4. Sampled-logprob models (Anthropic) — reported separately
-    sampled_results = [r for r in results if _is_sampled(r)]
-    if sampled_results:
-        _print_sampled_section(sampled_results, all_scenarios)
 
 
 def main():
