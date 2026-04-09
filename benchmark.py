@@ -73,8 +73,13 @@ MODELS = [
     "moonshotai/kimi-k2-0905",
     # Qwen — full logprobs (20), prefill works
     "qwen/qwen3-235b-a22b-2507",
-    # Anthropic — NO native logprobs; estimated via multi-sample at T=1
-    "anthropic/claude-sonnet-4",
+    # Anthropic — NO native logprobs; estimated via multi-sample at T=1.
+    # Prefill works on all EXCEPT 4.6 models (returns 400).
+    "anthropic/claude-3-opus",
+    "anthropic/claude-3-sonnet",
+    "anthropic/claude-3.5-sonnet",
+    "anthropic/claude-3.7-sonnet",
+    "anthropic/claude-4-sonnet-20250522",
 ]
 
 # OpenAI models error with require_parameters flag but work without it.
