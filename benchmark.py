@@ -771,8 +771,9 @@ def run_benchmark(single: bool = False, skip_sampled: bool = False):
     prepared: List[Dict[str, Any]] = []
 
     if single:
-        # One user_audit + one assistant_continue
-        to_run = [s for s in SCENARIOS if s["role_mode"] == "user_audit"][:1]
+        # All variants of one base scenario + one assistant_continue
+        first_base = next(s["base_scenario"] for s in SCENARIOS if s["role_mode"] == "user_audit")
+        to_run = [s for s in SCENARIOS if s.get("base_scenario") == first_base]
         to_run += [s for s in SCENARIOS if s["role_mode"] == "assistant_continue"][:1]
     else:
         to_run = SCENARIOS
