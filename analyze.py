@@ -227,10 +227,126 @@ def average_to_base(df_var: pd.DataFrame, weighted: bool = True) -> pd.DataFrame
 
 
 def filter_to_variant(df_var: pd.DataFrame, variant_suffix: str) -> pd.DataFrame:
-    """Return only rows where the scenario name ends with the given suffix (e.g. '_v1')."""
+    """Return only ACTUAL variants (user_audit scenarios where name = base + suffix).
+
+    BUGFIX: previously matched name.endswith('_v1'), which also picks up
+    Sandbag_Model_Graded_v1 (an assistant_continue scenario whose name
+    happens to end with _v1 but is its own base, not a variant of anything).
+    The correct discriminator is name != base_scenario + variant must match.
+    """
     if len(df_var) == 0:
         return df_var
-    return df_var[df_var["scenario"].str.endswith(variant_suffix)].copy()
+    # A row is a variant if its scenario name is exactly base_scenario + suffix
+    mask = df_var.apply(
+        lambda r: r["scenario"] == r["base_scenario"] + variant_suffix,
+        axis=1,
+    )
+    return df_var[mask].copy()
+
+
+def variance_components(df_var: pd.DataFrame) -> Dict[str, float]:
+    """Decompose total lp_diff variance into model, scenario, interaction, residual.
+
+    Fits two WLS models on variant-level data:
+      1. Additive:    lp_diff ~ C(model) + C(base_scenario)
+      2. Interaction: lp_diff ~ C(model) + C(base_scenario) + C(model):C(base_scenario)
+
+    The interaction SS (difference in SSR) tells us how much of the variance
+    the additive model misses. Residual SS in the interaction model is the
+    within-cell variance — variant-level noise.
+
+    This directly tests whether the additive model is adequate.
+    """
+    if len(df_var) < 10:
+        return {}
+
+    # Keep only cells with ≥2 variants (needed for residual df in interaction model)
+    cell_counts = df_var.groupby(["model", "base_scenario"]).size()
+    multi_var_cells = cell_counts[cell_counts >= 2].index
+    keep_mask = df_var.set_index(["model", "base_scenario"]).index.isin(multi_var_cells)
+    df_mv = df_var[keep_mask].copy()
+
+    result: Dict[str, float] = {}
+    result["n_obs"] = len(df_var)
+    result["n_cells"] = len(cell_counts)
+    result["n_multi_var_cells"] = len(multi_var_cells)
+
+    if len(df_mv) < 10 or len(multi_var_cells) < 2:
+        return result
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            # Weighted total SS (around weighted grand mean)
+            w = df_mv["engagement"].values
+            y = df_mv["lp_diff"].values
+            w_sum = w.sum()
+            if w_sum < 1e-12:
+                return result
+            gm = (w * y).sum() / w_sum
+            total_ss = float((w * (y - gm) ** 2).sum())
+
+            # Fit additive model
+            m_add = smf.wls(
+                "lp_diff ~ C(model) + C(base_scenario)",
+                data=df_mv, weights=df_mv["engagement"],
+            ).fit()
+            # Fit full interaction model
+            m_int = smf.wls(
+                "lp_diff ~ C(model) + C(base_scenario) + C(model):C(base_scenario)",
+                data=df_mv, weights=df_mv["engagement"],
+            ).fit()
+            # Fit model-only and scenario-only
+            m_mod = smf.wls(
+                "lp_diff ~ C(model)", data=df_mv, weights=df_mv["engagement"],
+            ).fit()
+            m_scen = smf.wls(
+                "lp_diff ~ C(base_scenario)", data=df_mv, weights=df_mv["engagement"],
+            ).fit()
+
+            result["total_ss"] = total_ss
+            result["model_only_ssr"] = float(m_mod.ssr)
+            result["scenario_only_ssr"] = float(m_scen.ssr)
+            result["additive_ssr"] = float(m_add.ssr)
+            result["interaction_ssr"] = float(m_int.ssr)
+
+            # Sequential sum-of-squares (Type I decomposition)
+            result["ss_model"] = total_ss - result["model_only_ssr"]  # variance model alone explains
+            result["ss_scenario"] = total_ss - result["scenario_only_ssr"]
+            result["ss_model_given_scen"] = result["scenario_only_ssr"] - result["additive_ssr"]
+            result["ss_scen_given_mod"] = result["model_only_ssr"] - result["additive_ssr"]
+            result["ss_interaction"] = result["additive_ssr"] - result["interaction_ssr"]
+            result["ss_residual"] = result["interaction_ssr"]
+
+            # Proportions of total SS
+            for key in ["ss_model", "ss_scenario", "ss_interaction", "ss_residual"]:
+                result[key + "_pct"] = 100 * result[key] / total_ss if total_ss > 0 else 0
+
+            # F-test for model effect (main effect after scenario, ignoring interaction)
+            df_num = (m_scen.df_resid - m_add.df_resid)
+            df_den = m_add.df_resid
+            if df_num > 0 and df_den > 0 and result["additive_ssr"] > 0:
+                f_stat = (result["ss_model_given_scen"] / df_num) / (result["additive_ssr"] / df_den)
+                p_val = 1 - stats.f.cdf(f_stat, df_num, df_den)
+                result["f_model_given_scen"] = f_stat
+                result["f_model_df_num"] = df_num
+                result["f_model_df_den"] = df_den
+                result["p_model_given_scen"] = p_val
+
+            # F-test for interaction
+            df_num_int = (m_add.df_resid - m_int.df_resid)
+            df_den_int = m_int.df_resid
+            if df_num_int > 0 and df_den_int > 0 and result["interaction_ssr"] > 0:
+                f_int = (result["ss_interaction"] / df_num_int) / (result["interaction_ssr"] / df_den_int)
+                p_int = 1 - stats.f.cdf(f_int, df_num_int, df_den_int)
+                result["f_interaction"] = f_int
+                result["f_interaction_df_num"] = df_num_int
+                result["f_interaction_df_den"] = df_den_int
+                result["p_interaction"] = p_int
+    except Exception as e:
+        result["error"] = str(e)
+
+    return result
 
 
 def maxt_permutation(df: pd.DataFrame, n_perm: int = 50000, weighted: bool = True) -> Dict[Tuple[str, str], Tuple[float, float, float]]:
@@ -360,6 +476,58 @@ def run_analysis(data: Dict[str, Any]) -> None:
         bases = sorted(mdf["base_scenario"].tolist())
         print(f"    {model:<34} {len(mdf):>6} {len(mdf_v):>6} {np.mean(eng):>9.4f} {', '.join(s[:10] for s in bases)}")
 
+    # --- Variance components analysis (variant-level) ---
+    # This tells us where the variance lives: model main effect, scenario,
+    # interaction, or within-cell (variant-level) noise. If interaction
+    # dominates, additive models are inappropriate.
+    print(f"\n  VARIANCE COMPONENTS (two-way ANOVA with interaction, variant-level)")
+    print(f"  Decomposes total lp_diff variance into main effects, interaction,")
+    print(f"  and within-cell (variant-level) residual. Requires ≥2 variants per cell.")
+    vc = variance_components(df_var)
+    if "ss_model" in vc:
+        print(f"  Multi-variant cells: {vc['n_multi_var_cells']}/{vc['n_cells']}  |  Obs: {vc['n_obs']}")
+        print(f"  {'Component':<32} {'SS':>12} {'%':>7}  {'F':>8}  {'df':>10}  {'p':>9}")
+        print(f"  {'-' * 90}")
+        # Model main effect (adjusted for scenario)
+        f_m = vc.get("f_model_given_scen", float("nan"))
+        p_m = vc.get("p_model_given_scen", float("nan"))
+        df_m = (vc.get("f_model_df_num", 0), vc.get("f_model_df_den", 0))
+        print(f"  {'Model | Scenario':<32} {vc['ss_model_given_scen']:>12.2f} "
+              f"{100*vc['ss_model_given_scen']/vc['total_ss']:>6.1f}%  "
+              f"{f_m:>8.3f}  ({df_m[0]},{df_m[1]:.0f})  {p_m:>9.4f}")
+        # Scenario main effect (adjusted for model)
+        print(f"  {'Scenario | Model':<32} {vc['ss_scen_given_mod']:>12.2f} "
+              f"{100*vc['ss_scen_given_mod']/vc['total_ss']:>6.1f}%  "
+              f"{'---':>8}  {'---':>10}  {'---':>9}")
+        # Interaction
+        f_i = vc.get("f_interaction", float("nan"))
+        p_i = vc.get("p_interaction", float("nan"))
+        df_i = (vc.get("f_interaction_df_num", 0), vc.get("f_interaction_df_den", 0))
+        print(f"  {'Model × Scenario interaction':<32} {vc['ss_interaction']:>12.2f} "
+              f"{vc['ss_interaction_pct']:>6.1f}%  "
+              f"{f_i:>8.3f}  ({df_i[0]},{df_i[1]:.0f})  {p_i:>9.4f}")
+        # Residual (within-cell, variant-level noise)
+        print(f"  {'Within-cell (variant noise)':<32} {vc['ss_residual']:>12.2f} "
+              f"{vc['ss_residual_pct']:>6.1f}%  "
+              f"{'---':>8}  {'---':>10}  {'---':>9}")
+        print(f"  {'-' * 90}")
+        print(f"  {'TOTAL':<32} {vc['total_ss']:>12.2f} {100.0:>6.1f}%")
+        print(f"  (Type I sequential SS, adjusting for terms already in the model)")
+
+        # Key interpretations
+        ratio_int_to_main = vc['ss_interaction'] / max(vc['ss_model_given_scen'], 1e-9)
+        ratio_int_to_resid = vc['ss_interaction'] / max(vc['ss_residual'], 1e-9)
+        print(f"\n  Interaction / Model main effect: {ratio_int_to_main:.1f}x")
+        print(f"  Interaction / Residual (noise):  {ratio_int_to_resid:.1f}x")
+        if ratio_int_to_main > 2:
+            print(f"  → Interaction dominates main effect: additive model is misspecified.")
+            print(f"    Model effects are scenario-dependent. Pairwise tests on shared")
+            print(f"    scenarios remain valid; averages across scenarios are fragile.")
+        if vc.get("p_interaction", 1) < 0.05:
+            print(f"  → Model×Scenario interaction is statistically significant (p<0.05).")
+    else:
+        print(f"  (Not enough data for variance decomposition — need ≥2 variants per cell)")
+
     # --- Per-model marginal means (NO extrapolation) ---
     # Previously used WLS EMMs that predicted unobserved cells via the
     # additive model — but that model is misspecified (massive interaction)
@@ -411,34 +579,36 @@ def run_analysis(data: Dict[str, Any]) -> None:
     print(f"  The pairwise tests below are the rigorous inference.")
 
     # --- Engagement-honesty correlation diagnostic ---
+    # Uses VARIANT-LEVEL data (2-3x more observations per model than base averages),
+    # providing more statistical power for the correlation check.
     # Real concern: if a model has high engagement when scheming and low
     # when honest (e.g., quick "Yes" vs lengthy explanations), engagement
     # weighting upweights its scheming observations, biasing the analysis.
-    print(f"\n  ENGAGEMENT × LP_DIFF CORRELATION (within-model confound check)")
-    print(f"  Tests whether each model's engagement is systematically related to")
-    print(f"  its scheming tendency. A strong positive correlation would mean")
-    print(f"  engagement weighting upweights scheming observations (bias upward).")
-    print(f"  {'Model':<34} {'Pearson r':>11} {'Spearman ρ':>12} {'N':>4} {'Concern':>9}")
-    print(f"  {'-' * 75}")
+    print(f"\n  ENGAGEMENT × LP_DIFF CORRELATION (variant-level, within-model)")
+    print(f"  Detects whether a model's engagement is systematically related to its")
+    print(f"  lp_diff. A strong correlation would indicate engagement weighting is")
+    print(f"  a confound (upweighting one class of responses over the other).")
+    print(f"  {'Model':<34} {'Pearson r':>11} {'Spearman ρ':>12} {'N_var':>6} {'Concern':>9}")
+    print(f"  {'-' * 78}")
     eng_corrs = []
     for model in scorable_models:
-        mdf = df[df["model"] == model]
+        mdf = df_var[df_var["model"] == model]
         if len(mdf) < 4:
-            print(f"  {model:<34} {'---':>11} {'---':>12} {len(mdf):>4} {'n<4':>9}")
+            print(f"  {model:<34} {'---':>11} {'---':>12} {len(mdf):>6} {'n<4':>9}")
             continue
         r_p, p_p = stats.pearsonr(mdf["engagement"], mdf["lp_diff"])
         r_s, p_s = stats.spearmanr(mdf["engagement"], mdf["lp_diff"])
-        concern = "**" if abs(r_s) > 0.6 and p_s < 0.1 else "*" if abs(r_s) > 0.4 else ""
-        print(f"  {model:<34} {r_p:>+11.3f} {r_s:>+12.3f} {len(mdf):>4} {concern:>9}")
-        eng_corrs.append((model, r_p, r_s))
-    print(f"  {'-' * 75}")
-    print(f"  Strong positive correlation → engagement weighting may inflate the model's score")
-    print(f"  Strong negative correlation → engagement weighting may deflate the model's score")
-    n_concerned = sum(1 for _, _, rs in eng_corrs if abs(rs) > 0.6)
+        concern = "**" if abs(r_s) > 0.6 and p_s < 0.05 else "*" if abs(r_s) > 0.4 and p_s < 0.1 else ""
+        print(f"  {model:<34} {r_p:>+11.3f} {r_s:>+12.3f} {len(mdf):>6} {concern:>9}")
+        eng_corrs.append((model, r_p, r_s, p_s))
+    print(f"  {'-' * 78}")
+    print(f"  Strong +corr → weighting inflates scheming; strong −corr → deflates it")
+    n_concerned = sum(1 for _, _, rs, ps in eng_corrs if abs(rs) > 0.6 and ps < 0.05)
     if n_concerned > 0:
-        print(f"  ⚠ {n_concerned} model(s) show possible engagement-honesty correlation (|ρ| > 0.6)")
+        print(f"  ⚠ {n_concerned} model(s) show significant engagement-honesty correlation")
+        print(f"    Sensitivity 1 (unweighted maxT) below will show if conclusions change.")
     else:
-        print(f"  No strong engagement-honesty correlations detected.")
+        print(f"  ✓ No significant engagement-honesty correlations (all |ρ|<0.6 or p≥0.05)")
 
     # --- Pairwise tests with maxT correction ---
     print(f"\n{'=' * 90}")
@@ -544,47 +714,93 @@ def run_analysis(data: Dict[str, Any]) -> None:
     else:
         print(f"  ✓ Conclusions are robust to engagement weighting choice")
 
-    # ----- Sensitivity 2: Per-variant maxT -----
-    # Variants probe the same construct with different question phrasings.
-    # If they agree on significance, averaging is justified. If they disagree,
-    # the variant-averaged result is hiding heterogeneity.
+    # ----- Sensitivity 2: Per-variant DIRECTION AND EFFECT SIZE -----
+    # The point of averaging variants is DENOISING. Individual variants
+    # will naturally have higher p-values than the average (that's the
+    # whole point of reducing noise via replication). The real question:
+    # do the variants AGREE in direction and magnitude? If yes, averaging
+    # is justified noise reduction. If no, averaging masks heterogeneity.
     print(f"\n{'=' * 90}")
-    print(f"  SENSITIVITY 2: PER-VARIANT maxT")
-    print(f"  Run the test separately on each variant (v1, v2, v3) and the average.")
-    print(f"  Agreement across variants → averaging justified.")
-    print(f"  Disagreement → some variants probe a different construct.")
+    print(f"  SENSITIVITY 2: VARIANT AGREEMENT (direction + magnitude)")
+    print(f"  Variants are designed to denoise: individual variants have HIGHER p-values")
+    print(f"  than the average (by design). The question is whether they POINT THE SAME WAY.")
+    print(f"  Sign agreement + similar magnitudes → averaging is valid denoising.")
+    print(f"  Sign disagreement → averaging masks real heterogeneity (bad).")
     print(f"{'=' * 90}")
 
-    # Run maxT on each variant subset
-    variant_results = {}
+    # Build per-variant, per-pair weighted mean lp_diff (no permutation, just point estimate)
+    def _pair_weighted_mean_lpdiff(df_sub, a, b):
+        """Weighted mean lp_diff for pair (a, b) on shared scenarios in df_sub."""
+        lookup_sub = {(r["model"], r["base_scenario"]): r for _, r in df_sub.iterrows()}
+        scens = sorted(df_sub["base_scenario"].unique())
+        diffs, ws = [], []
+        for s in scens:
+            ra = lookup_sub.get((a, s))
+            rb = lookup_sub.get((b, s))
+            if ra is not None and rb is not None:
+                diffs.append(ra["lp_diff"] - rb["lp_diff"])
+                ws.append(min(ra["engagement"], rb["engagement"]))
+        if not diffs or sum(ws) < 1e-12:
+            return None, 0
+        w_tot = sum(ws)
+        return sum(w * d for w, d in zip(ws, diffs)) / w_tot, len(diffs)
+
+    variant_dfs = {}
     for suffix in ["_v1", "_v2", "_v3"]:
         sub_var = filter_to_variant(df_var, suffix)
-        if len(sub_var) == 0:
-            variant_results[suffix] = None
-            continue
-        sub_avg = average_to_base(sub_var, weighted=True)
-        if len(sub_avg) < 3:
-            variant_results[suffix] = None
-            continue
-        print(f"\n  Running maxT on variant {suffix} ({len(sub_avg)} obs, 20,000 iterations)...", flush=True)
-        variant_results[suffix] = maxt_permutation(sub_avg, n_perm=20000, weighted=True)
+        if len(sub_var) > 0:
+            variant_dfs[suffix] = average_to_base(sub_var, weighted=True)
+        else:
+            variant_dfs[suffix] = None
 
-    print(f"\n  Significance pattern across variants (p_maxT):")
-    print(f"  {'Pair':<55} {'avg':>8} {'v1':>8} {'v2':>8} {'v3':>8}")
-    print(f"  {'-' * 95}")
-    for i in order[:10]:
-        a, b = display_data[i][0], display_data[i][1]
-        p_avg = maxt_results[(a, b)][2]
-        ps = []
+    # For each pair (sorted by p_maxT), compute per-variant lp_diff and check sign
+    per_pair_signs: Dict[Tuple[str, str], Tuple[list, int, int]] = {}
+    for i, (a, b, stat, pm, px, n, dz) in enumerate(display_data):
+        stats_per_v = []
         for suffix in ["_v1", "_v2", "_v3"]:
-            if variant_results[suffix] is not None and (a, b) in variant_results[suffix]:
-                ps.append(f"{variant_results[suffix][(a, b)][2]:.3f}")
+            if variant_dfs[suffix] is not None and len(variant_dfs[suffix]) > 0:
+                s, _ = _pair_weighted_mean_lpdiff(variant_dfs[suffix], a, b)
+                stats_per_v.append(s)
             else:
-                ps.append("---")
-        print(f"  {a + ' vs ' + b:<55} {p_avg:>8.3f} {ps[0]:>8} {ps[1]:>8} {ps[2]:>8}")
-    print(f"  {'-' * 95}")
-    print(f"  Compare each row: do v1, v2, v3 give similar p-values to the avg?")
-    print(f"  Large disagreement = the variants probe different constructs and averaging masks it.")
+                stats_per_v.append(None)
+        valid = [s for s in stats_per_v if s is not None]
+        same_sign = sum(1 for s in valid if (s > 0) == (stat > 0)) if valid else 0
+        per_pair_signs[(a, b)] = (stats_per_v, same_sign, len(valid))
+
+    # Display: show top 10 with detail, then all-pairs agreement summary
+    print(f"\n  Top 10 pairs by p_maxT — variant-level lp_diff (shared scenarios):")
+    print(f"  {'Pair':<55} {'avg':>9} {'v1':>9} {'v2':>9} {'v3':>9} {'signs':>8}")
+    print(f"  {'-' * 105}")
+    for i in order[:10]:
+        a, b, stat, _, _, _, _ = display_data[i]
+        stats_per_v, same, total = per_pair_signs[(a, b)]
+        vs = [f"{s:+.3f}" if s is not None else "---" for s in stats_per_v]
+        mark = "✓" if same == total and total > 0 else "✗"
+        sign_str = f"{same}/{total} {mark}" if total > 0 else "n/a"
+        print(f"  {a + ' vs ' + b:<55} {stat:>+9.3f} {vs[0]:>9} {vs[1]:>9} {vs[2]:>9} {sign_str:>8}")
+    print(f"  {'-' * 105}")
+
+    # ALL-pairs sign agreement summary (not just top 10)
+    all_consistent = sum(1 for (a, b) in pairs
+                         if per_pair_signs[(a, b)][1] == per_pair_signs[(a, b)][2]
+                         and per_pair_signs[(a, b)][2] > 0)
+    all_inconsistent = sum(1 for (a, b) in pairs
+                           if per_pair_signs[(a, b)][1] != per_pair_signs[(a, b)][2]
+                           and per_pair_signs[(a, b)][2] > 0)
+
+    # Sign agreement among significant pairs specifically
+    sig_pairs = [(a, b) for a, b, _, _, px, _, _ in display_data if px < 0.05]
+    sig_consistent = sum(1 for (a, b) in sig_pairs
+                         if per_pair_signs[(a, b)][1] == per_pair_signs[(a, b)][2]
+                         and per_pair_signs[(a, b)][2] > 0)
+
+    print(f"\n  ALL pairs sign agreement: {all_consistent}/{all_consistent + all_inconsistent} have unanimous direction")
+    print(f"  Significant pairs (p_maxT<0.05): {sig_consistent}/{len(sig_pairs)} have unanimous direction")
+    print(f"\n  Interpretation:")
+    print(f"    Individual variants will naturally have higher p-values than the average")
+    print(f"    — that's the POINT of denoising via replication. The question is whether")
+    print(f"    they all point the same way. If significant pairs show unanimous signs,")
+    print(f"    the averaged result is genuine denoising, not manufactured significance.")
 
     # --- Methodology ---
     print(f"\n{'=' * 90}")
