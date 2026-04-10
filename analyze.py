@@ -188,24 +188,23 @@ def exact_paired_permutation(diffs: List[float], weights: List[float]) -> Tuple[
     return obs_stat, p, n
 
 
-def maxt_permutation(df: pd.DataFrame, n_perm: int = 50000) -> Dict[Tuple[str, str], Tuple[float, float]]:
+def maxt_permutation(df: pd.DataFrame, n_perm: int = 50000) -> Dict[Tuple[str, str], Tuple[float, float, float]]:
     """Westfall-Young maxT permutation for all pairwise comparisons.
 
     Permutes model labels within each base_scenario simultaneously,
     computing ALL pairwise test statistics from the same permutation.
-    The adjusted p-value = P(max|T| ≥ |T_obs|), which naturally
-    accounts for the correlation between tests sharing models.
 
-    Controls FWER strongly while being less conservative than
-    Bonferroni/BH when tests are positively correlated.
+    Returns {(model_a, model_b): (observed_stat, marginal_p, maxT_p)}.
+      marginal_p: P(|T_pair| ≥ |T_obs|) under label-shuffle — uncorrected
+      maxT_p:     P(max_all |T| ≥ |T_obs|) — FWER-corrected
 
-    Returns {(model_a, model_b): (observed_stat, adjusted_p)}.
+    maxT_p ≥ marginal_p always. The ratio shows the correction cost.
+    For correlated tests (sharing models), the cost is less than Bonferroni.
     """
     models = sorted(df["model"].unique())
     scenarios = sorted(df["base_scenario"].unique())
     pairs = list(combinations(models, 2))
 
-    # Build lookup: scenario -> {model: (lp_diff, engagement)}
     scen_data: Dict[str, Dict[str, Tuple[float, float]]] = {}
     for scen in scenarios:
         sdf = df[df["base_scenario"] == scen]
@@ -214,7 +213,6 @@ def maxt_permutation(df: pd.DataFrame, n_perm: int = 50000) -> Dict[Tuple[str, s
             scen_data[scen][row["model"]] = (row["lp_diff"], row["engagement"])
 
     def _compute_all_stats(sd):
-        """Compute all pairwise weighted mean differences."""
         stats = {}
         for a, b in pairs:
             diffs, weights = [], []
@@ -233,16 +231,13 @@ def maxt_permutation(df: pd.DataFrame, n_perm: int = 50000) -> Dict[Tuple[str, s
                 stats[(a, b)] = 0.0
         return stats
 
-    # Observed statistics
     obs_stats = _compute_all_stats(scen_data)
 
-    # Permutation distribution of max|T|
     rng = np.random.RandomState(42)
-    # Track how many permutations have max|T| >= each observed |T|
-    n_ge = {pair: 0 for pair in pairs}
+    n_ge_marginal = {pair: 0 for pair in pairs}  # per-pair (uncorrected)
+    n_ge_max = {pair: 0 for pair in pairs}       # max-corrected (FWER)
 
     for _ in range(n_perm):
-        # Shuffle model labels within each scenario
         perm_sd: Dict[str, Dict[str, Tuple[float, float]]] = {}
         for scen in scenarios:
             if scen not in scen_data:
@@ -255,16 +250,18 @@ def maxt_permutation(df: pd.DataFrame, n_perm: int = 50000) -> Dict[Tuple[str, s
         perm_stats = _compute_all_stats(perm_sd)
         max_t = max(abs(s) for s in perm_stats.values()) if perm_stats else 0.0
 
-        # Step-down: each test's adjusted p = P(maxT >= |T_obs|)
         for pair in pairs:
+            if abs(perm_stats.get(pair, 0.0)) >= abs(obs_stats[pair]) - 1e-12:
+                n_ge_marginal[pair] += 1
             if max_t >= abs(obs_stats[pair]) - 1e-12:
-                n_ge[pair] += 1
+                n_ge_max[pair] += 1
 
     results = {}
     for pair in pairs:
         obs = obs_stats[pair]
-        adj_p = (n_ge[pair] + 1) / (n_perm + 1)
-        results[pair] = (obs, adj_p)
+        marg_p = (n_ge_marginal[pair] + 1) / (n_perm + 1)
+        max_p = (n_ge_max[pair] + 1) / (n_perm + 1)
+        results[pair] = (obs, marg_p, max_p)
 
     return results
 
@@ -372,15 +369,14 @@ def run_analysis(data: Dict[str, Any]) -> None:
     maxt_results = maxt_permutation(df, n_perm=50000)
     pairs = list(combinations(scorable_models, 2))
 
-    # Also compute per-pair stats for display
+    # Compute per-pair stats for display
     lookup = {}
     for _, row in df.iterrows():
         lookup[(row["model"], row["base_scenario"])] = row
 
     display_data = []
     for a, b in pairs:
-        obs_stat, adj_p = maxt_results[(a, b)]
-        # Count shared scenarios and Cohen's d
+        obs_stat, p_marg, p_max = maxt_results[(a, b)]
         diffs = []
         for bs in base_scenarios:
             ra = lookup.get((a, bs))
@@ -393,35 +389,27 @@ def run_analysis(data: Dict[str, Any]) -> None:
             cohens_d = float(np.mean(d_arr) / np.std(d_arr, ddof=1)) if np.std(d_arr, ddof=1) > 0 else 0.0
         else:
             cohens_d = 0.0
-        # Also get uncorrected p from paired test
-        weights = []
-        clean_diffs = []
-        for bs in base_scenarios:
-            ra = lookup.get((a, bs))
-            rb = lookup.get((b, bs))
-            if ra is not None and rb is not None:
-                clean_diffs.append(ra["lp_diff"] - rb["lp_diff"])
-                weights.append(min(ra["engagement"], rb["engagement"]))
-        _, p_uncorr, _ = exact_paired_permutation(clean_diffs, weights) if clean_diffs else (0, 1, 0)
-        display_data.append((a, b, obs_stat, p_uncorr, adj_p, n_shared, cohens_d))
+        display_data.append((a, b, obs_stat, p_marg, p_max, n_shared, cohens_d))
 
     print(f"\n  {len(pairs)} pairwise tests")
-    print(f"\n  {'Model A':<26} {'Model B':<26} {'N':>3} {'Δ(w)':>8} {'p_pair':>9} {'p_maxT':>9} {'d':>6} {'Sig':>5}")
+    print(f"\n  {'Model A':<26} {'Model B':<26} {'N':>3} {'Δ(w)':>8} {'p_marg':>9} {'p_maxT':>9} {'d':>6} {'Sig':>5}")
     print(f"  {'-' * 100}")
 
     order = sorted(range(len(display_data)), key=lambda i: display_data[i][4])
     for i in order:
-        a, b, stat, p_unc, p_adj, n, d = display_data[i]
-        pu = f"{p_unc:.4f}" if p_unc >= 1e-4 else f"{p_unc:.1e}"
-        pa = f"{p_adj:.4f}" if p_adj >= 1e-4 else f"{p_adj:.1e}"
-        sig = "***" if p_adj < 0.001 else "**" if p_adj < 0.01 else "*" if p_adj < 0.05 else ""
-        print(f"  {a:<26} {b:<26} {n:>3} {stat:>+8.4f} {pu:>9} {pa:>9} {d:>+6.2f} {sig:>5}")
+        a, b, stat, pm, px, n, d = display_data[i]
+        pms = f"{pm:.4f}" if pm >= 1e-4 else f"{pm:.1e}"
+        pxs = f"{px:.4f}" if px >= 1e-4 else f"{px:.1e}"
+        sig = "***" if px < 0.001 else "**" if px < 0.01 else "*" if px < 0.05 else ""
+        print(f"  {a:<26} {b:<26} {n:>3} {stat:>+8.4f} {pms:>9} {pxs:>9} {d:>+6.2f} {sig:>5}")
 
     print(f"  {'-' * 100}")
     print(f"  N = shared base scenarios (variants averaged within each)")
     print(f"  Δ(w) = engagement-weighted mean lp_diff (+ = A more scheming)")
-    print(f"  p_pair = uncorrected exact paired permutation p")
-    print(f"  p_maxT = Westfall-Young maxT adjusted p (accounts for shared-model correlation)")
+    print(f"  p_marg = marginal label-shuffle p (uncorrected)")
+    print(f"  p_maxT = Westfall-Young maxT adjusted p (FWER-corrected)")
+    print(f"  p_maxT ≥ p_marg always; ratio shows the correction cost")
+    print(f"  Both use the SAME permutation scheme (label-shuffle within scenarios)")
     n_sig = sum(1 for dd in display_data if dd[4] < 0.05)
     print(f"\n  {n_sig} significant pairs at FWER < 0.05 (maxT)")
 
