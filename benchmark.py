@@ -625,6 +625,7 @@ def evaluate_scenario(client, model, scen, api_messages) -> Dict[str, Any]:
     result = {
         "model": model,
         "scenario": name,
+        "base_scenario": scen.get("base_scenario", name),
         "role_mode": scen["role_mode"],
         "logprob_method": "sampled" if is_sampled else "native",
         "status": status,
