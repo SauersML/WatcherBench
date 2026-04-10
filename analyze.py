@@ -201,7 +201,39 @@ def exact_paired_permutation(diffs: List[float], weights: List[float]) -> Tuple[
     return obs_stat, p, n
 
 
-def maxt_permutation(df: pd.DataFrame, n_perm: int = 50000) -> Dict[Tuple[str, str], Tuple[float, float, float]]:
+def average_to_base(df_var: pd.DataFrame, weighted: bool = True) -> pd.DataFrame:
+    """Average variant-level data to one row per (model, base_scenario).
+
+    weighted=True: engagement-weighted (current default)
+    weighted=False: uniform (each variant counts equally) — sensitivity check
+    """
+    if len(df_var) == 0:
+        return df_var
+    rows = []
+    for (model, base), grp in df_var.groupby(["model", "base_scenario"]):
+        if weighted and grp["engagement"].sum() > 1e-12:
+            avg_lp = float(np.average(grp["lp_diff"], weights=grp["engagement"]))
+        else:
+            avg_lp = float(np.mean(grp["lp_diff"]))
+        rows.append({
+            "model": model,
+            "base_scenario": base,
+            "role_mode": grp["role_mode"].iloc[0],
+            "lp_diff": avg_lp,
+            "engagement": float(np.mean(grp["engagement"])),
+            "n_variants": len(grp),
+        })
+    return pd.DataFrame(rows)
+
+
+def filter_to_variant(df_var: pd.DataFrame, variant_suffix: str) -> pd.DataFrame:
+    """Return only rows where the scenario name ends with the given suffix (e.g. '_v1')."""
+    if len(df_var) == 0:
+        return df_var
+    return df_var[df_var["scenario"].str.endswith(variant_suffix)].copy()
+
+
+def maxt_permutation(df: pd.DataFrame, n_perm: int = 50000, weighted: bool = True) -> Dict[Tuple[str, str], Tuple[float, float, float]]:
     """Westfall-Young maxT permutation for all pairwise comparisons.
 
     Permutes model labels within each base_scenario simultaneously,
@@ -228,7 +260,7 @@ def maxt_permutation(df: pd.DataFrame, n_perm: int = 50000) -> Dict[Tuple[str, s
     def _compute_all_stats(sd):
         stats = {}
         for a, b in pairs:
-            diffs, weights = [], []
+            diffs, ws = [], []
             for scen in scenarios:
                 if scen not in sd:
                     continue
@@ -236,10 +268,10 @@ def maxt_permutation(df: pd.DataFrame, n_perm: int = 50000) -> Dict[Tuple[str, s
                     da, wa = sd[scen][a]
                     db, wb = sd[scen][b]
                     diffs.append(da - db)
-                    weights.append(min(wa, wb))
-            if diffs and sum(weights) > 1e-12:
-                w_total = sum(weights)
-                stats[(a, b)] = sum(w * d for w, d in zip(weights, diffs)) / w_total
+                    ws.append(min(wa, wb) if weighted else 1.0)
+            if diffs and sum(ws) > 1e-12:
+                w_total = sum(ws)
+                stats[(a, b)] = sum(w * d for w, d in zip(ws, diffs)) / w_total
             else:
                 stats[(a, b)] = 0.0
         return stats
@@ -473,7 +505,86 @@ def run_analysis(data: Dict[str, Any]) -> None:
     print(f"        Use for ranking pairs by effect, not for comparing to between-subject literature.")
     print(f"  p_maxT ≥ p_marg always; ratio shows the correlation-aware correction cost")
     n_sig = sum(1 for dd in display_data if dd[4] < 0.05)
-    print(f"\n  {n_sig} significant pairs at FWER < 0.05 (maxT)")
+    print(f"\n  {n_sig} significant pairs at FWER < 0.05 (maxT, weighted)")
+
+    # =====================================================================
+    # SENSITIVITY ANALYSES — substantive robustness checks, not caveats
+    # =====================================================================
+
+    # ----- Sensitivity 1: Unweighted maxT -----
+    # Engagement weighting is one specific choice. If results depend on it,
+    # we have a problem. If they agree, the conclusion is robust.
+    print(f"\n{'=' * 90}")
+    print(f"  SENSITIVITY 1: UNWEIGHTED maxT (uniform weights)")
+    print(f"  Same test, but every observation contributes equally.")
+    print(f"  Disagreement with the weighted analysis would flag a confound.")
+    print(f"{'=' * 90}")
+    print(f"\n  Running unweighted maxT (50,000 iterations)...", flush=True)
+    maxt_unw = maxt_permutation(df, n_perm=50000, weighted=False)
+
+    # Compare significance patterns
+    weighted_sig = {pair: maxt_results[pair][2] < 0.05 for pair in pairs}
+    unweighted_sig = {pair: maxt_unw[pair][2] < 0.05 for pair in pairs}
+    agree = sum(1 for p in pairs if weighted_sig[p] == unweighted_sig[p])
+    disagree_pairs = [p for p in pairs if weighted_sig[p] != unweighted_sig[p]]
+
+    print(f"\n  {'Pair':<55} {'p_maxT (w)':>12} {'p_maxT (unw)':>14} {'agree?':>8}")
+    print(f"  {'-' * 95}")
+    # Show only the top-ranked pairs (by weighted p)
+    for i in order[:10]:
+        a, b = display_data[i][0], display_data[i][1]
+        pw = maxt_results[(a, b)][2]
+        pu = maxt_unw[(a, b)][2]
+        match = "✓" if (pw < 0.05) == (pu < 0.05) else "✗"
+        print(f"  {a + ' vs ' + b:<55} {pw:>12.4f} {pu:>14.4f} {match:>8}")
+    print(f"  {'-' * 95}")
+    print(f"  Significance pattern: {agree}/{len(pairs)} pairs agree between weighted and unweighted")
+    if disagree_pairs:
+        print(f"  ⚠ Disagreement on: {[f'{a}/{b}' for a,b in disagree_pairs]}")
+    else:
+        print(f"  ✓ Conclusions are robust to engagement weighting choice")
+
+    # ----- Sensitivity 2: Per-variant maxT -----
+    # Variants probe the same construct with different question phrasings.
+    # If they agree on significance, averaging is justified. If they disagree,
+    # the variant-averaged result is hiding heterogeneity.
+    print(f"\n{'=' * 90}")
+    print(f"  SENSITIVITY 2: PER-VARIANT maxT")
+    print(f"  Run the test separately on each variant (v1, v2, v3) and the average.")
+    print(f"  Agreement across variants → averaging justified.")
+    print(f"  Disagreement → some variants probe a different construct.")
+    print(f"{'=' * 90}")
+
+    # Run maxT on each variant subset
+    variant_results = {}
+    for suffix in ["_v1", "_v2", "_v3"]:
+        sub_var = filter_to_variant(df_var, suffix)
+        if len(sub_var) == 0:
+            variant_results[suffix] = None
+            continue
+        sub_avg = average_to_base(sub_var, weighted=True)
+        if len(sub_avg) < 3:
+            variant_results[suffix] = None
+            continue
+        print(f"\n  Running maxT on variant {suffix} ({len(sub_avg)} obs, 20,000 iterations)...", flush=True)
+        variant_results[suffix] = maxt_permutation(sub_avg, n_perm=20000, weighted=True)
+
+    print(f"\n  Significance pattern across variants (p_maxT):")
+    print(f"  {'Pair':<55} {'avg':>8} {'v1':>8} {'v2':>8} {'v3':>8}")
+    print(f"  {'-' * 95}")
+    for i in order[:10]:
+        a, b = display_data[i][0], display_data[i][1]
+        p_avg = maxt_results[(a, b)][2]
+        ps = []
+        for suffix in ["_v1", "_v2", "_v3"]:
+            if variant_results[suffix] is not None and (a, b) in variant_results[suffix]:
+                ps.append(f"{variant_results[suffix][(a, b)][2]:.3f}")
+            else:
+                ps.append("---")
+        print(f"  {a + ' vs ' + b:<55} {p_avg:>8.3f} {ps[0]:>8} {ps[1]:>8} {ps[2]:>8}")
+    print(f"  {'-' * 95}")
+    print(f"  Compare each row: do v1, v2, v3 give similar p-values to the avg?")
+    print(f"  Large disagreement = the variants probe different constructs and averaging masks it.")
 
     # --- Methodology ---
     print(f"\n{'=' * 90}")
