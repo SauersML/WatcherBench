@@ -151,27 +151,19 @@ def build_analysis_df(results: List[Dict]) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
 
 # ---------------------------------------------------------------------------
-# Exact paired permutation test
+# Permutation tests
 # ---------------------------------------------------------------------------
 
 def exact_paired_permutation(diffs: List[float], weights: List[float]) -> Tuple[float, float, int]:
-    """Exact two-sided paired permutation test with engagement weights.
-
-    Enumerates all 2^n sign-flips of the paired differences.
-    Test statistic: engagement-weighted mean difference.
-    Returns (weighted_mean_diff, exact_p, n_pairs).
-    """
+    """Exact two-sided paired permutation test with engagement weights."""
     n = len(diffs)
     if n == 0:
         return 0.0, 1.0, 0
-
     w_total = sum(weights)
     if w_total < 1e-12:
         return 0.0, 1.0, 0
-
     obs_stat = sum(w * d for w, d in zip(weights, diffs)) / w_total
-
-    if n <= 20:  # 2^20 = 1M, feasible for exact enumeration
+    if n <= 20:
         n_perm = 2 ** n
         n_ge = 0
         for mask in range(n_perm):
@@ -184,7 +176,6 @@ def exact_paired_permutation(diffs: List[float], weights: List[float]) -> Tuple[
                 n_ge += 1
         p = n_ge / n_perm
     else:
-        # Monte Carlo fallback for very large n
         rng = np.random.RandomState(42)
         n_mc = 100000
         n_ge = 0
@@ -194,8 +185,88 @@ def exact_paired_permutation(diffs: List[float], weights: List[float]) -> Tuple[
             if abs(perm_stat) >= abs(obs_stat) - 1e-12:
                 n_ge += 1
         p = (n_ge + 1) / (n_mc + 1)
-
     return obs_stat, p, n
+
+
+def maxt_permutation(df: pd.DataFrame, n_perm: int = 50000) -> Dict[Tuple[str, str], Tuple[float, float]]:
+    """Westfall-Young maxT permutation for all pairwise comparisons.
+
+    Permutes model labels within each base_scenario simultaneously,
+    computing ALL pairwise test statistics from the same permutation.
+    The adjusted p-value = P(max|T| ≥ |T_obs|), which naturally
+    accounts for the correlation between tests sharing models.
+
+    Controls FWER strongly while being less conservative than
+    Bonferroni/BH when tests are positively correlated.
+
+    Returns {(model_a, model_b): (observed_stat, adjusted_p)}.
+    """
+    models = sorted(df["model"].unique())
+    scenarios = sorted(df["base_scenario"].unique())
+    pairs = list(combinations(models, 2))
+
+    # Build lookup: scenario -> {model: (lp_diff, engagement)}
+    scen_data: Dict[str, Dict[str, Tuple[float, float]]] = {}
+    for scen in scenarios:
+        sdf = df[df["base_scenario"] == scen]
+        scen_data[scen] = {}
+        for _, row in sdf.iterrows():
+            scen_data[scen][row["model"]] = (row["lp_diff"], row["engagement"])
+
+    def _compute_all_stats(sd):
+        """Compute all pairwise weighted mean differences."""
+        stats = {}
+        for a, b in pairs:
+            diffs, weights = [], []
+            for scen in scenarios:
+                if scen not in sd:
+                    continue
+                if a in sd[scen] and b in sd[scen]:
+                    da, wa = sd[scen][a]
+                    db, wb = sd[scen][b]
+                    diffs.append(da - db)
+                    weights.append(min(wa, wb))
+            if diffs and sum(weights) > 1e-12:
+                w_total = sum(weights)
+                stats[(a, b)] = sum(w * d for w, d in zip(weights, diffs)) / w_total
+            else:
+                stats[(a, b)] = 0.0
+        return stats
+
+    # Observed statistics
+    obs_stats = _compute_all_stats(scen_data)
+
+    # Permutation distribution of max|T|
+    rng = np.random.RandomState(42)
+    # Track how many permutations have max|T| >= each observed |T|
+    n_ge = {pair: 0 for pair in pairs}
+
+    for _ in range(n_perm):
+        # Shuffle model labels within each scenario
+        perm_sd: Dict[str, Dict[str, Tuple[float, float]]] = {}
+        for scen in scenarios:
+            if scen not in scen_data:
+                continue
+            models_in = list(scen_data[scen].keys())
+            values = list(scen_data[scen].values())
+            perm_idx = rng.permutation(len(models_in))
+            perm_sd[scen] = {models_in[i]: values[perm_idx[i]] for i in range(len(models_in))}
+
+        perm_stats = _compute_all_stats(perm_sd)
+        max_t = max(abs(s) for s in perm_stats.values()) if perm_stats else 0.0
+
+        # Step-down: each test's adjusted p = P(maxT >= |T_obs|)
+        for pair in pairs:
+            if max_t >= abs(obs_stats[pair]) - 1e-12:
+                n_ge[pair] += 1
+
+    results = {}
+    for pair in pairs:
+        obs = obs_stats[pair]
+        adj_p = (n_ge[pair] + 1) / (n_perm + 1)
+        results[pair] = (obs, adj_p)
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -283,78 +354,76 @@ def run_analysis(data: Dict[str, Any]) -> None:
         except Exception as e:
             print(f"\n  WLS failed: {e}")
 
-    # --- Exact paired permutation tests on base-scenario averages ---
+    # --- Pairwise tests with maxT correction ---
     print(f"\n{'=' * 90}")
-    print(f"  PAIRWISE TESTS (exact paired permutation on base-scenario averages)")
-    print(f"  Variants averaged per base scenario → one measurement per unit.")
-    print(f"  Permutation at base-scenario level → correct effective N.")
-    print(f"  Polarity-flipped variants cancel yes-bias within each scenario.")
+    print(f"  PAIRWISE TESTS")
+    print(f"  Westfall-Young maxT permutation (50,000 iterations).")
+    print(f"  Shuffles ALL model labels within each scenario simultaneously.")
+    print(f"  Adjusted p = P(max|T| ≥ |T_obs|) — accounts for correlation")
+    print(f"  between tests sharing models. Less conservative than BH/Bonferroni.")
     print(f"{'=' * 90}")
 
     if len(scorable_models) < 2:
         print("\n  Need at least 2 models.")
         return
 
-    # Build lookup on averaged data
+    # Run maxT permutation
+    print(f"\n  Running maxT permutation (50,000 iterations)...", flush=True)
+    maxt_results = maxt_permutation(df, n_perm=50000)
+    pairs = list(combinations(scorable_models, 2))
+
+    # Also compute per-pair stats for display
     lookup = {}
     for _, row in df.iterrows():
         lookup[(row["model"], row["base_scenario"])] = row
 
-    pairs = list(combinations(scorable_models, 2))
-    pair_results = []
-
+    display_data = []
     for a, b in pairs:
+        obs_stat, adj_p = maxt_results[(a, b)]
+        # Count shared scenarios and Cohen's d
         diffs = []
-        weights = []
-        shared = []
         for bs in base_scenarios:
             ra = lookup.get((a, bs))
             rb = lookup.get((b, bs))
             if ra is not None and rb is not None:
-                d = ra["lp_diff"] - rb["lp_diff"]
-                w = min(ra["engagement"], rb["engagement"])
-                diffs.append(d)
-                weights.append(w)
-                shared.append(bs)
-
-        if not diffs:
-            pair_results.append((a, b, 0.0, 1.0, 0, 0.0))
-            continue
-
-        mean_diff, p_exact, n_shared = exact_paired_permutation(diffs, weights)
-
+                diffs.append(ra["lp_diff"] - rb["lp_diff"])
+        n_shared = len(diffs)
         if len(diffs) > 1:
             d_arr = np.array(diffs)
             cohens_d = float(np.mean(d_arr) / np.std(d_arr, ddof=1)) if np.std(d_arr, ddof=1) > 0 else 0.0
         else:
             cohens_d = 0.0
-
-        pair_results.append((a, b, mean_diff, p_exact, n_shared, cohens_d))
-
-    # BH FDR correction
-    raw_pvals = [pr[3] for pr in pair_results]
-    _, corrected, _, _ = multipletests(raw_pvals, method="fdr_bh")
+        # Also get uncorrected p from paired test
+        weights = []
+        clean_diffs = []
+        for bs in base_scenarios:
+            ra = lookup.get((a, bs))
+            rb = lookup.get((b, bs))
+            if ra is not None and rb is not None:
+                clean_diffs.append(ra["lp_diff"] - rb["lp_diff"])
+                weights.append(min(ra["engagement"], rb["engagement"]))
+        _, p_uncorr, _ = exact_paired_permutation(clean_diffs, weights) if clean_diffs else (0, 1, 0)
+        display_data.append((a, b, obs_stat, p_uncorr, adj_p, n_shared, cohens_d))
 
     print(f"\n  {len(pairs)} pairwise tests")
-    print(f"\n  {'Model A':<26} {'Model B':<26} {'N':>3} {'Δ(w)':>8} {'p_exact':>9} {'q(BH)':>9} {'d':>6} {'Sig':>5}")
-    print(f"  {'-' * 95}")
+    print(f"\n  {'Model A':<26} {'Model B':<26} {'N':>3} {'Δ(w)':>8} {'p_pair':>9} {'p_maxT':>9} {'d':>6} {'Sig':>5}")
+    print(f"  {'-' * 100}")
 
-    order = sorted(range(len(pair_results)), key=lambda i: corrected[i])
+    order = sorted(range(len(display_data)), key=lambda i: display_data[i][4])
     for i in order:
-        a, b, md, p, n, d = pair_results[i]
-        q = corrected[i]
-        ps = f"{p:.4f}" if p >= 1e-4 else f"{p:.1e}"
-        qs = f"{q:.4f}" if q >= 1e-4 else f"{q:.1e}"
-        sig = "***" if q < 0.001 else "**" if q < 0.01 else "*" if q < 0.05 else ""
-        print(f"  {a:<26} {b:<26} {n:>3} {md:>+8.4f} {ps:>9} {qs:>9} {d:>+6.2f} {sig:>5}")
+        a, b, stat, p_unc, p_adj, n, d = display_data[i]
+        pu = f"{p_unc:.4f}" if p_unc >= 1e-4 else f"{p_unc:.1e}"
+        pa = f"{p_adj:.4f}" if p_adj >= 1e-4 else f"{p_adj:.1e}"
+        sig = "***" if p_adj < 0.001 else "**" if p_adj < 0.01 else "*" if p_adj < 0.05 else ""
+        print(f"  {a:<26} {b:<26} {n:>3} {stat:>+8.4f} {pu:>9} {pa:>9} {d:>+6.2f} {sig:>5}")
 
-    print(f"  {'-' * 95}")
+    print(f"  {'-' * 100}")
     print(f"  N = shared base scenarios (variants averaged within each)")
-    print(f"  Δ(w) = engagement-weighted mean lp_diff difference (+ = A more scheming)")
-    print(f"  p_exact = exact two-sided permutation p (all 2^n sign-flips at base-scenario level)")
-    print(f"  q(BH) = Benjamini-Hochberg FDR-corrected")
-    n_sig = sum(1 for q in corrected if q < 0.05)
-    print(f"\n  {n_sig} significant pairs at FDR q < 0.05")
+    print(f"  Δ(w) = engagement-weighted mean lp_diff (+ = A more scheming)")
+    print(f"  p_pair = uncorrected exact paired permutation p")
+    print(f"  p_maxT = Westfall-Young maxT adjusted p (accounts for shared-model correlation)")
+    n_sig = sum(1 for dd in display_data if dd[4] < 0.05)
+    print(f"\n  {n_sig} significant pairs at FWER < 0.05 (maxT)")
 
     # --- Methodology ---
     print(f"\n{'=' * 90}")
@@ -365,9 +434,10 @@ def run_analysis(data: Dict[str, Any]) -> None:
     print(f"              Controls for question-phrasing noise + yes-bias")
     print(f"  Outcome:    lp_diff = log P(dec) - log P(hon), best available k")
     print(f"  Ranking:    WLS EMMs on variant-averaged data, engagement-weighted")
-    print(f"  Pairwise:   exact paired permutation at base-scenario level")
-    print(f"              Effective N = shared base scenarios (not variants)")
-    print(f"  Correction: Benjamini-Hochberg FDR")
+    print(f"  Pairwise:   exact paired permutation + Westfall-Young maxT correction")
+    print(f"              maxT shuffles all model labels within scenarios simultaneously,")
+    print(f"              accounting for correlation between tests sharing models.")
+    print(f"              Less conservative than BH/Bonferroni for correlated tests.")
     print(f"  Missing:    MNAR — excluded, documented below")
     print()
 
