@@ -19,9 +19,9 @@ Two scenario categories (reported separately for scientific validity):
                  (XML tags, etc.) competing with target tokens.
 
 Usage:
-    python benchmark.py            # full benchmark (all models)
-    python benchmark.py --fast     # native logprobs only (skip Anthropic, ~2 min)
-    python benchmark.py --single   # one scenario per category, quick test
+    python benchmark.py              # native logprobs models only (default, ~3 min)
+    python benchmark.py --claude     # include Anthropic models (Monte Carlo, ~80 min)
+    python benchmark.py --single     # one base scenario, quick test
 """
 
 import collections
@@ -881,5 +881,5 @@ def run_benchmark(single: bool = False, skip_sampled: bool = False):
 
 if __name__ == "__main__":
     single_mode = "--single" in sys.argv
-    skip_sampled = "--no-claude" in sys.argv or "--fast" in sys.argv
-    run_benchmark(single=single_mode, skip_sampled=skip_sampled)
+    include_sampled = "--claude" in sys.argv
+    run_benchmark(single=single_mode, skip_sampled=not include_sampled)
