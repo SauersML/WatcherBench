@@ -98,6 +98,24 @@ def print_heatmap(results, models, scenarios, title):
 # Build analysis dataframe
 # ---------------------------------------------------------------------------
 
+# Build polarity lookup from the benchmark's SCENARIOS list
+try:
+    from benchmark import SCENARIOS as _BENCH_SCENARIOS
+    _POLARITY: Dict[str, int] = {}
+    for _s in _BENCH_SCENARIOS:
+        _name = _s["name"]
+        _dec = _s["deceptive_token"]
+        # Yes/No polarity for yes-bias cancellation
+        if _dec == "Yes":
+            _POLARITY[_name] = +1
+        elif _dec == "No":
+            _POLARITY[_name] = -1
+        else:
+            _POLARITY[_name] = 0  # Solved/Modified etc.
+except ImportError:
+    _POLARITY = {}
+
+
 def build_analysis_df(results: List[Dict]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Build per-variant DataFrame, then average across variants per base_scenario.
 
@@ -133,6 +151,7 @@ def build_analysis_df(results: List[Dict]) -> Tuple[pd.DataFrame, pd.DataFrame]:
             "p_dec": p_dec, "p_hon": p_hon,
             "engagement": p_dec + p_hon,
             "top_k": r.get("top_k", 0),
+            "polarity": _POLARITY.get(r["scenario"], 0),
         })
     df_var = pd.DataFrame(rows)
     if len(df_var) == 0:
@@ -245,17 +264,23 @@ def filter_to_variant(df_var: pd.DataFrame, variant_suffix: str) -> pd.DataFrame
 
 
 def variance_components(df_var: pd.DataFrame) -> Dict[str, float]:
-    """Decompose total lp_diff variance into model, scenario, interaction, residual.
+    """Variance decomposition accounting for the variant design structure.
 
-    Fits two WLS models on variant-level data:
-      1. Additive:    lp_diff ~ C(model) + C(base_scenario)
-      2. Interaction: lp_diff ~ C(model) + C(base_scenario) + C(model):C(base_scenario)
+    Variants are NOT random replicates — they're structured:
+      - polarity (dec=Yes vs dec=No) — designed to cancel yes-bias via averaging
+      - different question framings — designed to probe same construct differently
 
-    The interaction SS (difference in SSR) tells us how much of the variance
-    the additive model misses. Residual SS in the interaction model is the
-    within-cell variance — variant-level noise.
+    Treating variant disagreement as pure noise is wrong: much of it is
+    signal from the designed polarity structure. We include polarity and
+    polarity×model as fixed factors to absorb yes-bias, leaving a cleaner
+    residual that reflects true within-cell noise.
 
-    This directly tests whether the additive model is adequate.
+    Fits a hierarchy of models:
+      1. Empty:         lp_diff ~ 1
+      2. Scenario:      + C(base_scenario)
+      3. + Model:       + C(model)
+      4. + Model×Scen:  + C(model):C(base_scenario)
+      5. + Polarity:    + polarity + polarity:C(model)  [yes-bias removal]
     """
     if len(df_var) < 10:
         return {}
@@ -277,7 +302,6 @@ def variance_components(df_var: pd.DataFrame) -> Dict[str, float]:
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            # Weighted total SS (around weighted grand mean)
             w = df_mv["engagement"].values
             y = df_mv["lp_diff"].values
             w_sum = w.sum()
@@ -286,63 +310,90 @@ def variance_components(df_var: pd.DataFrame) -> Dict[str, float]:
             gm = (w * y).sum() / w_sum
             total_ss = float((w * (y - gm) ** 2).sum())
 
-            # Fit additive model
-            m_add = smf.wls(
-                "lp_diff ~ C(model) + C(base_scenario)",
-                data=df_mv, weights=df_mv["engagement"],
-            ).fit()
-            # Fit full interaction model
-            m_int = smf.wls(
-                "lp_diff ~ C(model) + C(base_scenario) + C(model):C(base_scenario)",
-                data=df_mv, weights=df_mv["engagement"],
-            ).fit()
-            # Fit model-only and scenario-only
-            m_mod = smf.wls(
-                "lp_diff ~ C(model)", data=df_mv, weights=df_mv["engagement"],
-            ).fit()
-            m_scen = smf.wls(
-                "lp_diff ~ C(base_scenario)", data=df_mv, weights=df_mv["engagement"],
-            ).fit()
+            # Helper: fit WLS and return SSR
+            def _ssr(formula):
+                return float(smf.wls(formula, data=df_mv, weights=df_mv["engagement"]).fit().ssr)
+
+            # Sequential models — each adds a term
+            # (A) scenario only
+            ssr_S = _ssr("lp_diff ~ C(base_scenario)")
+            # (B) + model
+            ssr_SM = _ssr("lp_diff ~ C(base_scenario) + C(model)")
+            # (C) + polarity main effect (absorbs global yes-bias, if any)
+            ssr_SMp = _ssr("lp_diff ~ C(base_scenario) + C(model) + polarity")
+            # (D) + polarity × model (per-model yes-bias)
+            ssr_SMpMp = _ssr("lp_diff ~ C(base_scenario) + C(model) + polarity + polarity:C(model)")
+            # (E) + model × scenario interaction (full interaction)
+            ssr_full = _ssr("lp_diff ~ C(base_scenario) + C(model) + polarity + polarity:C(model) + C(model):C(base_scenario)")
+
+            # Also fit the empty and model-only models for SS calcs
+            ssr_null = total_ss  # residual with no predictors
+            ssr_M = _ssr("lp_diff ~ C(model)")
 
             result["total_ss"] = total_ss
-            result["model_only_ssr"] = float(m_mod.ssr)
-            result["scenario_only_ssr"] = float(m_scen.ssr)
-            result["additive_ssr"] = float(m_add.ssr)
-            result["interaction_ssr"] = float(m_int.ssr)
+            result["ssr_null"] = ssr_null
+            result["ssr_M"] = ssr_M
+            result["ssr_S"] = ssr_S
+            result["ssr_SM"] = ssr_SM
+            result["ssr_SMp"] = ssr_SMp
+            result["ssr_SMpMp"] = ssr_SMpMp
+            result["ssr_full"] = ssr_full
 
-            # Sequential sum-of-squares (Type I decomposition)
-            result["ss_model"] = total_ss - result["model_only_ssr"]  # variance model alone explains
-            result["ss_scenario"] = total_ss - result["scenario_only_ssr"]
-            result["ss_model_given_scen"] = result["scenario_only_ssr"] - result["additive_ssr"]
-            result["ss_scen_given_mod"] = result["model_only_ssr"] - result["additive_ssr"]
-            result["ss_interaction"] = result["additive_ssr"] - result["interaction_ssr"]
-            result["ss_residual"] = result["interaction_ssr"]
+            # Sequential SS (each term controlling for prior ones)
+            result["ss_scenario"] = ssr_null - ssr_S
+            result["ss_model_given_S"] = ssr_S - ssr_SM
+            result["ss_polarity_given_SM"] = ssr_SM - ssr_SMp  # global yes-bias
+            result["ss_polarity_by_model"] = ssr_SMp - ssr_SMpMp  # per-model yes-bias
+            result["ss_interaction"] = ssr_SMpMp - ssr_full
+            result["ss_residual"] = ssr_full  # true within-cell noise (after polarity removed)
 
-            # Proportions of total SS
-            for key in ["ss_model", "ss_scenario", "ss_interaction", "ss_residual"]:
+            # Proportions
+            for key in ["ss_scenario", "ss_model_given_S", "ss_polarity_given_SM",
+                        "ss_polarity_by_model", "ss_interaction", "ss_residual"]:
                 result[key + "_pct"] = 100 * result[key] / total_ss if total_ss > 0 else 0
 
-            # F-test for model effect (main effect after scenario, ignoring interaction)
-            df_num = (m_scen.df_resid - m_add.df_resid)
-            df_den = m_add.df_resid
-            if df_num > 0 and df_den > 0 and result["additive_ssr"] > 0:
-                f_stat = (result["ss_model_given_scen"] / df_num) / (result["additive_ssr"] / df_den)
-                p_val = 1 - stats.f.cdf(f_stat, df_num, df_den)
-                result["f_model_given_scen"] = f_stat
-                result["f_model_df_num"] = df_num
-                result["f_model_df_den"] = df_den
-                result["p_model_given_scen"] = p_val
+            # F-tests using the FINAL model's residual (so variance absorbed by
+            # polarity doesn't inflate the denominator)
+            final_resid = ssr_full
+            # Degrees of freedom
+            n_obs = len(df_mv)
+            n_models = df_mv["model"].nunique()
+            n_scens = df_mv["base_scenario"].nunique()
 
-            # F-test for interaction
-            df_num_int = (m_add.df_resid - m_int.df_resid)
-            df_den_int = m_int.df_resid
-            if df_num_int > 0 and df_den_int > 0 and result["interaction_ssr"] > 0:
-                f_int = (result["ss_interaction"] / df_num_int) / (result["interaction_ssr"] / df_den_int)
-                p_int = 1 - stats.f.cdf(f_int, df_num_int, df_den_int)
-                result["f_interaction"] = f_int
-                result["f_interaction_df_num"] = df_num_int
-                result["f_interaction_df_den"] = df_den_int
-                result["p_interaction"] = p_int
+            # Fit the full model to get df_resid
+            m_full = smf.wls(
+                "lp_diff ~ C(base_scenario) + C(model) + polarity + polarity:C(model) + C(model):C(base_scenario)",
+                data=df_mv, weights=df_mv["engagement"]
+            ).fit()
+            df_resid_full = m_full.df_resid
+            mse_full = final_resid / df_resid_full if df_resid_full > 0 else float("inf")
+
+            # Test: model main effect (given scenario)
+            df_num_m = n_models - 1
+            if df_num_m > 0 and df_resid_full > 0 and mse_full > 0:
+                f_m = (result["ss_model_given_S"] / df_num_m) / mse_full
+                p_m = 1 - stats.f.cdf(f_m, df_num_m, df_resid_full)
+                result["f_model"] = f_m
+                result["df_model"] = (df_num_m, df_resid_full)
+                result["p_model"] = p_m
+
+            # Test: per-model yes-bias (polarity × model)
+            df_num_pm = n_models - 1  # one bias per model (minus reference)
+            if df_num_pm > 0 and df_resid_full > 0 and mse_full > 0:
+                f_pm = (result["ss_polarity_by_model"] / df_num_pm) / mse_full
+                p_pm = 1 - stats.f.cdf(f_pm, df_num_pm, df_resid_full)
+                result["f_polarity_by_model"] = f_pm
+                result["p_polarity_by_model"] = p_pm
+
+            # Test: model×scenario interaction
+            df_num_i = (n_models - 1) * (n_scens - 1)  # approximate
+            if df_num_i > 0 and df_resid_full > 0 and mse_full > 0:
+                f_i = (result["ss_interaction"] / df_num_i) / mse_full
+                p_i = 1 - stats.f.cdf(f_i, df_num_i, df_resid_full)
+                result["f_interaction"] = f_i
+                result["p_interaction"] = p_i
+
+            result["df_resid_full"] = df_resid_full
     except Exception as e:
         result["error"] = str(e)
 
@@ -476,55 +527,58 @@ def run_analysis(data: Dict[str, Any]) -> None:
         bases = sorted(mdf["base_scenario"].tolist())
         print(f"    {model:<34} {len(mdf):>6} {len(mdf_v):>6} {np.mean(eng):>9.4f} {', '.join(s[:10] for s in bases)}")
 
-    # --- Variance components analysis (variant-level) ---
-    # This tells us where the variance lives: model main effect, scenario,
-    # interaction, or within-cell (variant-level) noise. If interaction
-    # dominates, additive models are inappropriate.
-    print(f"\n  VARIANCE COMPONENTS (two-way ANOVA with interaction, variant-level)")
-    print(f"  Decomposes total lp_diff variance into main effects, interaction,")
-    print(f"  and within-cell (variant-level) residual. Requires ≥2 variants per cell.")
+    # --- Variance decomposition accounting for polarity design ---
+    # Variants are structured (polarity flips to cancel yes-bias, different
+    # question framings). We model polarity explicitly so per-model yes-bias
+    # gets its own SS term instead of being dumped into residual noise.
+    # This gives a proper F-test for model main effect.
+    print(f"\n  VARIANCE DECOMPOSITION (variant-level, polarity-aware)")
+    print(f"  Sequential SS: lp_diff ~ Scenario → + Model → + Polarity → + Polarity×Model → + Model×Scenario")
+    print(f"  Polarity terms absorb yes-bias (v1/v3 vs v2 have opposite polarity).")
+    print(f"  Residual = true within-cell noise (after polarity structure removed).")
     vc = variance_components(df_var)
-    if "ss_model" in vc:
+    if "ss_model_given_S" in vc:
         print(f"  Multi-variant cells: {vc['n_multi_var_cells']}/{vc['n_cells']}  |  Obs: {vc['n_obs']}")
-        print(f"  {'Component':<32} {'SS':>12} {'%':>7}  {'F':>8}  {'df':>10}  {'p':>9}")
-        print(f"  {'-' * 90}")
-        # Model main effect (adjusted for scenario)
-        f_m = vc.get("f_model_given_scen", float("nan"))
-        p_m = vc.get("p_model_given_scen", float("nan"))
-        df_m = (vc.get("f_model_df_num", 0), vc.get("f_model_df_den", 0))
-        print(f"  {'Model | Scenario':<32} {vc['ss_model_given_scen']:>12.2f} "
-              f"{100*vc['ss_model_given_scen']/vc['total_ss']:>6.1f}%  "
-              f"{f_m:>8.3f}  ({df_m[0]},{df_m[1]:.0f})  {p_m:>9.4f}")
-        # Scenario main effect (adjusted for model)
-        print(f"  {'Scenario | Model':<32} {vc['ss_scen_given_mod']:>12.2f} "
-              f"{100*vc['ss_scen_given_mod']/vc['total_ss']:>6.1f}%  "
-              f"{'---':>8}  {'---':>10}  {'---':>9}")
-        # Interaction
-        f_i = vc.get("f_interaction", float("nan"))
-        p_i = vc.get("p_interaction", float("nan"))
-        df_i = (vc.get("f_interaction_df_num", 0), vc.get("f_interaction_df_den", 0))
-        print(f"  {'Model × Scenario interaction':<32} {vc['ss_interaction']:>12.2f} "
-              f"{vc['ss_interaction_pct']:>6.1f}%  "
-              f"{f_i:>8.3f}  ({df_i[0]},{df_i[1]:.0f})  {p_i:>9.4f}")
-        # Residual (within-cell, variant-level noise)
-        print(f"  {'Within-cell (variant noise)':<32} {vc['ss_residual']:>12.2f} "
-              f"{vc['ss_residual_pct']:>6.1f}%  "
-              f"{'---':>8}  {'---':>10}  {'---':>9}")
-        print(f"  {'-' * 90}")
-        print(f"  {'TOTAL':<32} {vc['total_ss']:>12.2f} {100.0:>6.1f}%")
-        print(f"  (Type I sequential SS, adjusting for terms already in the model)")
+        print(f"  {'Component':<35} {'SS':>11} {'%':>7}  {'F':>9}  {'p':>9}")
+        print(f"  {'-' * 82}")
 
-        # Key interpretations
-        ratio_int_to_main = vc['ss_interaction'] / max(vc['ss_model_given_scen'], 1e-9)
-        ratio_int_to_resid = vc['ss_interaction'] / max(vc['ss_residual'], 1e-9)
-        print(f"\n  Interaction / Model main effect: {ratio_int_to_main:.1f}x")
-        print(f"  Interaction / Residual (noise):  {ratio_int_to_resid:.1f}x")
-        if ratio_int_to_main > 2:
-            print(f"  → Interaction dominates main effect: additive model is misspecified.")
-            print(f"    Model effects are scenario-dependent. Pairwise tests on shared")
-            print(f"    scenarios remain valid; averages across scenarios are fragile.")
-        if vc.get("p_interaction", 1) < 0.05:
-            print(f"  → Model×Scenario interaction is statistically significant (p<0.05).")
+        def _row(label, ss, f=None, p=None):
+            pct = 100 * ss / vc['total_ss']
+            f_str = f"{f:>9.3f}" if f is not None and not math.isnan(f) else f"{'---':>9}"
+            p_str = f"{p:>9.4f}" if p is not None and not math.isnan(p) else f"{'---':>9}"
+            print(f"  {label:<35} {ss:>11.2f} {pct:>6.1f}%  {f_str}  {p_str}")
+
+        _row("Scenario", vc['ss_scenario'])
+        _row("Model | Scenario", vc['ss_model_given_S'],
+             vc.get('f_model'), vc.get('p_model'))
+        _row("Polarity (global) | S+M", vc['ss_polarity_given_SM'])
+        _row("Polarity × Model | S+M+P", vc['ss_polarity_by_model'],
+             vc.get('f_polarity_by_model'), vc.get('p_polarity_by_model'))
+        _row("Model × Scenario | all above", vc['ss_interaction'],
+             vc.get('f_interaction'), vc.get('p_interaction'))
+        _row("Residual (within-cell noise)", vc['ss_residual'])
+        print(f"  {'-' * 82}")
+        _row("TOTAL", vc['total_ss'])
+
+        p_m = vc.get('p_model', 1.0)
+        p_pm = vc.get('p_polarity_by_model', 1.0)
+        p_i = vc.get('p_interaction', 1.0)
+
+        print(f"\n  Key tests (using final-model residual as denominator):")
+        sig_m = "***" if p_m < 0.001 else "**" if p_m < 0.01 else "*" if p_m < 0.05 else "n.s."
+        sig_pm = "***" if p_pm < 0.001 else "**" if p_pm < 0.01 else "*" if p_pm < 0.05 else "n.s."
+        sig_i = "***" if p_i < 0.001 else "**" if p_i < 0.01 else "*" if p_i < 0.05 else "n.s."
+        print(f"    Model main effect:     p = {p_m:.4f}  {sig_m}")
+        print(f"    Per-model yes-bias:    p = {p_pm:.4f}  {sig_pm}")
+        print(f"    Model × Scenario:      p = {p_i:.4f}  {sig_i}")
+
+        # Variance NOT attributable to noise or yes-bias
+        real_signal = vc['ss_model_given_S'] + vc['ss_interaction']
+        bias_ss = vc['ss_polarity_given_SM'] + vc['ss_polarity_by_model']
+        print(f"\n  Bias-vs-signal decomposition (of non-scenario variance):")
+        print(f"    Model signal (main + interaction): {real_signal:>8.1f} ({100*real_signal/vc['total_ss']:.1f}%)")
+        print(f"    Yes-bias (polarity terms):         {bias_ss:>8.1f} ({100*bias_ss/vc['total_ss']:.1f}%)")
+        print(f"    True within-cell noise:            {vc['ss_residual']:>8.1f} ({vc['ss_residual_pct']:.1f}%)")
     else:
         print(f"  (Not enough data for variance decomposition — need ≥2 variants per cell)")
 
